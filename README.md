@@ -40,7 +40,7 @@ Check out the `tests/simple_demo` directory for example usage and project config
 - [x] Simple Linux build support
 - [x] Incremental builds (avoid recompiling unchanged files)
 - [x] Add self rebuilding capability
-- [ ] Clean parameter support
+- [x] Clean parameter support
 - [ ] Dependency graph support (build ordering of files)
 - [ ] Parallel translation units support
 - [ ] Windows support

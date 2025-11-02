@@ -46,6 +46,7 @@ void Meta::operator=(const Meta& rhs)
 static std::vector<Target> targets {};
 static std::filesystem::path build_directory {"./build_dir"};  // build in "build_dir" by default
 static std::filesystem::path project_directory {std::filesystem::current_path()};
+static bool clean_mode{false};
 
 void set_project_directory(const std::string_view& project_dir)
 {
@@ -274,11 +275,18 @@ void link_target(const Target& target, const bool use_build_dir = true, const st
 
 void build_target(const std::string_view& target, const std::source_location location = std::source_location::current())
 {
-    auto& found_target = get_target(target, location);
-    const bool USE_BUILD_DIR {true};
+    if (clean_mode)
+    {
+        std::filesystem::remove_all(build_directory);
+    }
+    else 
+    {
+        auto& found_target = get_target(target, location);
+        const bool USE_BUILD_DIR {true};
 
-    compile_target(found_target, USE_BUILD_DIR, location);
-    link_target(found_target, USE_BUILD_DIR, location);
+        compile_target(found_target, USE_BUILD_DIR, location);
+        link_target(found_target, USE_BUILD_DIR, location);
+    }
 }
 
 void restart_itself(const std::string& binary_name)
@@ -286,6 +294,25 @@ void restart_itself(const std::string& binary_name)
     std::println("Restarting with new binary: {}", binary_name);
     execl(binary_name.c_str(), binary_name.c_str(), (char*)nullptr);
     exit(0);
+}
+
+void clean_target_build_artifacts(const Target& target, const bool use_build_dir)
+{
+    for (const auto& source : target.sources)
+    {
+        std::filesystem::path object_file{};
+        if (use_build_dir)
+        {
+            auto canonical_build_dir = std::filesystem::canonical(build_directory);
+            object_file = (canonical_build_dir / source) += ".o";
+        }
+        else
+        {
+            (object_file = source) += ".o";
+        }
+
+        std::filesystem::remove(object_file);
+    }
 }
 
 void self_rebuild(const std::filesystem::path& nobs_build_script_source_file, const Meta& meta_info)
@@ -300,6 +327,7 @@ void self_rebuild(const std::filesystem::path& nobs_build_script_source_file, co
     const bool DONT_USE_BUILD_DIR {false};
     compile_target(nobs_target, DONT_USE_BUILD_DIR);
     link_target(nobs_target, DONT_USE_BUILD_DIR);
+    clean_target_build_artifacts(nobs_target, DONT_USE_BUILD_DIR);
 
     make_meta_file(nobs_build_script_source_file, build_directory.parent_path(), meta_info);
     std::println("Build binary rebuilt. Restarting build application!");
@@ -338,12 +366,30 @@ void enable_self_rebuild(const std::source_location& location = std::source_loca
 
 }
 
+void enable_command_line_params(const int argc, const char* argv[])
+{
+    if (argc == 1) return;
+
+    auto first_param = std::string(argv[1]);
+
+    if (first_param == "--help" || first_param == "-h" )
+    {
+        std::println("usage: {}", argv[0]);
+        std::println("  -c, --clean\t- cleans build artifacts");
+        std::println("  -h, --help\t- shows this help");
+        exit(0);
+    }
+
+    if (first_param == "--clean" || first_param == "-c")
+    {
+        clean_mode = true;
+    }
+}
+
 void DEBUG_list()
 {
     std::println("Project_dir:\t{}", std::filesystem::canonical(project_directory).string());
-    
-    create_directory_if_missing(build_directory);
-    std::println("Build_dir:\t{}", std::filesystem::canonical(build_directory).string());
+    std::println("Build_dir:\t{}", build_directory.string());
 
     for (const auto& t : targets)
     {
