@@ -28,5 +28,5 @@ int main(const int argc, const char* argv[])
     add_target_compile_flag("demo2", "-std=c++23");
     build_target("demo2");
 
-    DEBUG_list();
+    //DEBUG_list();
 }

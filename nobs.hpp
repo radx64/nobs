@@ -15,6 +15,12 @@ namespace nobs
     auto constexpr compiler = "g++";
     auto constexpr linker = "g++";
 
+    constexpr auto RESET_FONT = "\033[0m";
+    constexpr auto RED_FONT   = "\033[31;1m";
+    constexpr auto GREEN_FONT = "\033[32;1m";
+    constexpr auto YELLOW_FONT = "\033[33;1m";
+    constexpr auto BLUE_FONT  = "\033[34;1m";
+
 struct Target
 {
     std::string name;
@@ -76,7 +82,7 @@ void create_directory_if_missing(const std::filesystem::path directory)
     }
     catch (std::filesystem::filesystem_error& error)
     {
-        trace_error(std::format("ERR: got {} - code {}", error.what(), error.code().message()));
+        trace_error(std::format("ERROR: got {} - code {}", error.what(), error.code().message()));
         throw;
     }
 }
@@ -235,6 +241,7 @@ void compile_file(Target& target, const std::string& flags, const bool use_build
 
 void compile_target(Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
 {
+    std::println("{}Compiling target: {}{}", GREEN_FONT, target.name, RESET_FONT);
     create_directory_if_missing(build_directory);
     
     std::string flags{};
@@ -251,9 +258,10 @@ void compile_target(Target& target, const bool use_build_dir = true, const std::
 
 void link_target(const Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
 {
+    std::println("{}Linking target: {}{}", RED_FONT, target.name, RESET_FONT);
     if (not target.needs_linking)
     {
-        std::println("No need to relink {}", target.name);
+        std::println("{}No need to relink {}{}", BLUE_FONT, target.name, RESET_FONT);
         return;
     }
 
@@ -337,7 +345,8 @@ void self_rebuild(const std::filesystem::path& nobs_build_script_source_file, co
 void enable_self_rebuild(const std::source_location& location = std::source_location::current())
 {
     std::filesystem::path nobs_build_script_source{location.file_name()};
-    std::println("Nobs self rebuild active. File {} will be checked for changes every time build process is run", std::filesystem::canonical(nobs_build_script_source).string());
+    std::println("{}Nobs self rebuild active. File {} will be checked for changes every time build process is run {}", 
+        YELLOW_FONT, std::filesystem::canonical(nobs_build_script_source).string(), RESET_FONT);
 
     auto new_nobs_source_meta = prepare_new_meta_for_file(nobs_build_script_source, "--std=c++23");
     

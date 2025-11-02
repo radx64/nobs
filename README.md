@@ -36,13 +36,14 @@ Check out the `tests/simple_demo` directory for example usage and project config
 - No additional dependencies needed
 
 ## TODO
-
 - [x] Simple Linux build support
 - [x] Incremental builds (avoid recompiling unchanged files)
 - [x] Add self rebuilding capability
-- [x] Clean parameter support
+- [x] Clean build dir as parameter support
+- [ ] Linking parameters support
 - [ ] Dependency graph support (build ordering of files)
-- [ ] Parallel translation units support
+- [ ] Parallel translation units compilation support
+- [ ] Static and shared libraries support
 - [ ] Windows support
 
 ## License
