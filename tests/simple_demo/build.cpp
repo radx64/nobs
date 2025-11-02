@@ -1,8 +1,9 @@
 #include "nobs.hpp"
 
-int main()
+int main(const int argc, const char* argv[])
 {
     using namespace nobs;
+    enable_command_line_params(argc, argv);
     enable_self_rebuild();
     set_build_directory("./build_dir");
     add_executable("demo");
