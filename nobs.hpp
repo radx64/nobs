@@ -1,15 +1,19 @@
+#include <cstdlib>
+#include <filesystem>
+#include <format>
+#include <fstream>
 #include <print>
 #include <ranges>
+#include <source_location>
 #include <string_view>
 #include <string>
 #include <vector>
-#include <source_location>
-#include <format>
-#include <filesystem>
-#include <fstream>
+#include <unistd.h>
 
 namespace nobs
 {
+    auto constexpr compiler = "g++";
+    auto constexpr linker = "g++";
 
 struct Target
 {
@@ -23,6 +27,8 @@ struct Meta
 {
     uint64_t timestamp;
     std::string compile_flags;
+
+    void operator=(const Meta& rhs);
 };
 
 bool operator==(const Meta& lhs, const Meta& rhs)
@@ -31,8 +37,14 @@ bool operator==(const Meta& lhs, const Meta& rhs)
         and (lhs.compile_flags == rhs.compile_flags);
 }
 
+void Meta::operator=(const Meta& rhs)
+{
+    timestamp = rhs.timestamp;
+    compile_flags = rhs.compile_flags;
+}
+
 static std::vector<Target> targets {};
-static std::filesystem::path build_directory {"./build_dir"};  // build in "build" by default
+static std::filesystem::path build_directory {"./build_dir"};  // build in "build_dir" by default
 static std::filesystem::path project_directory {std::filesystem::current_path()};
 
 void set_project_directory(const std::string_view& project_dir)
@@ -173,11 +185,20 @@ void make_meta_file(const std::filesystem::path& source_file, const std::filesys
     } 
 }
 
-void compile_file(Target& target, const std::string& compiler, const std::string& flags, const std::filesystem::path& source)
+void compile_file(Target& target, const std::string& flags, const bool use_build_dir, const std::filesystem::path& source)
 {
     auto build_source_file = build_directory / source;
     auto build_source_path = build_source_file.parent_path();
-    create_directory_if_missing(build_source_path);
+
+    if (use_build_dir)  
+    {
+        create_directory_if_missing(build_source_path);
+    }
+    else   
+    {
+        build_source_file = source;
+        build_source_path = ".";
+    }
 
     auto object_file = std::filesystem::canonical(build_source_path);
     object_file /= source.filename();
@@ -189,9 +210,9 @@ void compile_file(Target& target, const std::string& compiler, const std::string
 
     if (std::filesystem::exists(meta_file))
     {
-        auto already_built_meta_info = read_meta_info_from_file(meta_file);
+        auto old = read_meta_info_from_file(meta_file);
 
-        if (already_built_meta_info == new_file_meta_info)
+        if (old == new_file_meta_info)
         {
             std::println("Source not changed. No need to build {}", std::filesystem::canonical(source).string());
             return;
@@ -211,11 +232,9 @@ void compile_file(Target& target, const std::string& compiler, const std::string
     make_meta_file(source, build_source_path, new_file_meta_info);
 }
 
-void compile_target(Target& target, const std::source_location location = std::source_location::current())
+void compile_target(Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
 {
     create_directory_if_missing(build_directory);
-
-    auto compiler = "g++"; 
     
     std::string flags{};
     for (const auto & flag : target.compile_flags)
@@ -225,11 +244,11 @@ void compile_target(Target& target, const std::source_location location = std::s
 
     for (const auto& source : target.sources)
     {    
-        compile_file(target, compiler, flags, source);
+        compile_file(target, flags, use_build_dir, source);
     }
 }
 
-void link_target(const Target& target, const std::source_location location = std::source_location::current())
+void link_target(const Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
 {
     if (not target.needs_linking)
     {
@@ -237,9 +256,8 @@ void link_target(const Target& target, const std::source_location location = std
         return;
     }
 
-    auto linker = "g++";
-
     auto canonical_build_dir = std::filesystem::canonical(build_directory);
+    if (not use_build_dir) canonical_build_dir = std::filesystem::canonical(".");
 
     auto link_parameters = std::format("-o {}", (canonical_build_dir / target.name).string());
 
@@ -256,10 +274,68 @@ void link_target(const Target& target, const std::source_location location = std
 
 void build_target(const std::string_view& target, const std::source_location location = std::source_location::current())
 {
-    auto& found = get_target(target, location);
+    auto& found_target = get_target(target, location);
+    const bool USE_BUILD_DIR {true};
 
-    compile_target(found, location);
-    link_target(found, location);
+    compile_target(found_target, USE_BUILD_DIR, location);
+    link_target(found_target, USE_BUILD_DIR, location);
+}
+
+void restart_itself(const std::string& binary_name)
+{
+    std::println("Restarting with new binary: {}", binary_name);
+    execl(binary_name.c_str(), binary_name.c_str(), (char*)nullptr);
+    exit(0);
+}
+
+void self_rebuild(const std::filesystem::path& nobs_build_script_source_file, const Meta& meta_info)
+{
+    Target nobs_target;
+    nobs_target.name = nobs_build_script_source_file.filename().stem();
+    nobs_target.compile_flags.push_back("--std=c++23");
+    nobs_target.compile_flags.push_back("-I ../..");
+    nobs_target.needs_linking = true;
+    nobs_target.sources.push_back(nobs_build_script_source_file.filename());
+
+    const bool DONT_USE_BUILD_DIR {false};
+    compile_target(nobs_target, DONT_USE_BUILD_DIR);
+    link_target(nobs_target, DONT_USE_BUILD_DIR);
+
+    make_meta_file(nobs_build_script_source_file, build_directory.parent_path(), meta_info);
+    std::println("Build binary rebuilt. Restarting build application!");
+    restart_itself(nobs_target.name);
+}
+
+void enable_self_rebuild(const std::source_location& location = std::source_location::current())
+{
+    std::filesystem::path nobs_build_script_source{location.file_name()};
+    std::println("Nobs self rebuild active. File {} will be checked for changes every time build process is run", std::filesystem::canonical(nobs_build_script_source).string());
+
+    auto new_nobs_source_meta = prepare_new_meta_for_file(nobs_build_script_source, "--std=c++23");
+    
+    auto old_nobs_source_meta_filename = get_file_metafile_name(nobs_build_script_source, ".");
+
+    if (std::filesystem::exists(old_nobs_source_meta_filename))
+    {
+        auto old_meta = read_meta_info_from_file(old_nobs_source_meta_filename);
+
+        if (old_meta == new_nobs_source_meta)
+        {
+            std::println("Nobs itself does not neeed to be rebuilt.");
+            return;
+        }
+        else
+        {
+            std::println("There are changes in build script so build application will be rebuild.");
+            self_rebuild(nobs_build_script_source, new_nobs_source_meta);
+        }
+    }
+    else
+    {
+        std::println("Nobs meta data not present. Assuming first run.");
+        make_meta_file(nobs_build_script_source, build_directory.parent_path(), new_nobs_source_meta);
+    }
+
 }
 
 void DEBUG_list()

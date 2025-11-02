@@ -3,6 +3,7 @@
 int main()
 {
     using namespace nobs;
+    enable_self_rebuild();
     set_build_directory("./build_dir");
     add_executable("demo");
     add_target_sources("demo", 

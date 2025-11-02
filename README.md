@@ -39,8 +39,9 @@ Check out the `tests/simple_demo` directory for example usage and project config
 
 - [x] Simple Linux build support
 - [x] Incremental builds (avoid recompiling unchanged files)
+- [x] Add self rebuilding capability
+- [ ] Clean parameter support
 - [ ] Dependency graph support (build ordering of files)
-- [ ] Add self rebuilding capability
 - [ ] Parallel translation units support
 - [ ] Windows support
 
