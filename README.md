@@ -38,7 +38,7 @@ Check out the `tests/simple_demo` directory for example usage and project config
 ## TODO
 
 - [x] Simple Linux build support
-- [ ] Build caching (avoid recompiling unchanged files)
+- [x] Incremental builds (avoid recompiling unchanged files)
 - [ ] Dependency graph support (build ordering of files)
 - [ ] Add self rebuilding capability
 - [ ] Parallel translation units support
