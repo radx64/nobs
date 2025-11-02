@@ -37,9 +37,11 @@ Check out the `tests/simple_demo` directory for example usage and project config
 
 ## TODO
 
-- [ ] Simple Linux build support
+- [x] Simple Linux build support
+- [ ] Build caching (avoid recompiling unchanged files)
+- [ ] Dependency graph support (build ordering of files)
+- [ ] Add self rebuilding capability
 - [ ] Parallel translation units support
-- [ ] Build caching
 - [ ] Windows support
 
 ## License

@@ -31,14 +31,27 @@ void set_build_directory(const std::string_view& build_dir)
     build_directory = std::string(build_dir);
 }
 
-void trace_error(const std::string_view& error_string, const std::source_location location)
+void trace_error(const std::string_view& error_string, const std::source_location location = std::source_location::current())
 {
-    std::println("Error at {}:{}: {}!", location.file_name(), location.line(), error_string);
+    std::println("Error at {}:{}: {}", location.file_name(), location.line(), error_string);
 }
 
 void add_executable(const std::string_view& name)
 {
     targets.emplace_back(std::string(name));
+}
+
+void create_directory_if_missing(const std::filesystem::path directory)
+{
+    try
+    { 
+        auto result = std::filesystem::create_directories(directory);
+    }
+    catch (std::filesystem::filesystem_error& error)
+    {
+        trace_error(std::format("ERR: got {} - code {}", error.what(), error.code().message()));
+        throw;
+    }
 }
 
 auto& get_target(const std::string_view& target, const std::source_location location = std::source_location::current())
@@ -106,10 +119,18 @@ void compile_target(const Target& target, const std::source_location location = 
 
     for (const auto& source : target.sources)
     {    
-        auto compile_parameters = std::format("-c -o {0}/{1}.o {1}", build_directory.string(), 
-            //std::filesystem::canonical(source).string());
-            source.string());
-        std::println("{} {}{}", compiler, flags, compile_parameters);
+        create_directory_if_missing(std::filesystem::canonical(build_directory));
+
+        auto build_source_file = build_directory / source;
+        auto build_source_path = build_source_file.parent_path();
+        create_directory_if_missing(build_source_path);
+
+        auto object_file = std::filesystem::canonical(build_source_path);
+        object_file /= source.filename();
+        object_file += ".o";
+        
+        auto compile_parameters = std::format("-c -o {0} {1}", object_file.string(), 
+            std::filesystem::canonical(source).string());
 
         auto job = std::format("{} {}{}", compiler, flags, compile_parameters);
         std::println("{}", job);
@@ -121,13 +142,15 @@ void compile_target(const Target& target, const std::source_location location = 
 void link_target(const Target& target, const std::source_location location = std::source_location::current())
 {
     auto linker = "g++";
-    auto link_parameters = std::format("-o {}", target.name);
+
+    auto canonical_build_dir = std::filesystem::canonical(build_directory);
+
+    auto link_parameters = std::format("-o {}", (canonical_build_dir / target.name).string());
 
     for (const auto& source : target.sources)
     {
-        link_parameters.append(std::format(" {}/{}.o", build_directory.string(), 
-            //std::filesystem::canonical(source).string()));
-            source.string()));
+        auto build_source_object_file = (canonical_build_dir / source) += ".o";
+        link_parameters.append(std::string(" ") + build_source_object_file.string());
     }
 
     auto job = std::format("{} {}", linker, link_parameters);
@@ -146,6 +169,8 @@ void build_target(const std::string_view& target, const std::source_location loc
 void DEBUG_list()
 {
     std::println("Project_dir:\t{}", std::filesystem::canonical(project_directory).string());
+    
+    create_directory_if_missing(build_directory);
     std::println("Build_dir:\t{}", std::filesystem::canonical(build_directory).string());
 
     for (const auto& t : targets)

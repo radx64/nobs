@@ -8,14 +8,23 @@ int main()
     add_target_sources("demo", 
         {
             "main.cpp",
-            "foo.cpp"
+            "foo.cpp",
+            "subdir/bar.cpp"
         });
 
     add_target_compile_flag("demo", "-std=c++23");
-            
-    //add_target_source("error", "main.cpp");
+    build_target("demo");
+
+    add_executable("demo2");
+    add_target_sources("demo2", 
+        {
+            "main.cpp",
+            "foo2.cpp",
+            "subdir2/bar.cpp"
+        });
+
+    add_target_compile_flag("demo2", "-std=c++23");
+    build_target("demo2");
 
     DEBUG_list();
-
-    build_target("demo");
 }
