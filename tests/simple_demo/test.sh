@@ -1,2 +1,3 @@
 rm ./build ./build.cpp.meta
-g++ -g --std=c++23 -I ../../ -o ./build build.cpp && ./build
+
+g++ $LDFLAGS $CPPFLAGS -g --std=gnu++23 -I ../../ -o ./build build.cpp && ./build

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <utility>
 
 namespace nobs
 {
@@ -27,6 +28,16 @@ struct Target
     std::vector<std::filesystem::path> sources;
     std::vector<std::string> compile_flags;
     bool needs_linking {false};
+
+    Target() = default;
+    Target(const std::string_view& target_name) : name(target_name) {}
+
+    Target(Target&& rhs) = default;
+    Target& operator=(Target&& rhs) = default;
+
+protected:
+    Target(const Target& rhs) = default;
+    Target& operator=(const Target& rhs) = default;
 };
 
 struct Meta
@@ -69,9 +80,9 @@ void trace_error(const std::string_view& error_string, const std::source_locatio
     std::println("Error at {}:{}: {}", location.file_name(), location.line(), error_string);
 }
 
-void add_executable(const std::string_view& name)
+Target& add_executable(const std::string_view& name)
 {
-    targets.emplace_back(std::string(name));
+    return targets.emplace_back(name);
 }
 
 void create_directory_if_missing(const std::filesystem::path directory)
@@ -87,6 +98,7 @@ void create_directory_if_missing(const std::filesystem::path directory)
     }
 }
 
+// Todo this might be removed later if not needed
 auto& get_target(const std::string_view& target, const std::source_location location = std::source_location::current())
 {
     auto view = targets 
@@ -102,42 +114,39 @@ auto& get_target(const std::string_view& target, const std::source_location loca
     return view.front();
 }
 
-void add_target_sources(const std::string_view& target, 
+void add_target_sources(Target& target, 
     const std::vector<std::string_view>& sources, 
     const std::source_location location = std::source_location::current())
 {
-    auto& found = get_target(target, location);
-
     for (const auto& source : sources)
     {
-        found.sources.push_back(std::filesystem::path(source));
+        target.sources.push_back(std::filesystem::path(source));
     }
 }
 
-void add_target_source(const std::string_view& target, 
+void add_target_source(Target& target,
     const std::string_view& source, 
     const std::source_location location = std::source_location::current())
 {
     add_target_sources(target, {source}, location);
 }
 
-void add_target_compile_flags(const std::string_view& target,
+void add_target_compile_flags(Target& target,
     const std::vector<std::string_view>& flags,
     const std::source_location location = std::source_location::current())
 {
-    auto& found = get_target(target, location);
-
     for (const auto& flag : flags)
     {
-        found.compile_flags.push_back(std::string(flag));
+        target.compile_flags.push_back(std::string(flag));
     }    
 }
 
-void add_target_compile_flag(const std::string_view& target,
+void add_target_compile_flag(Target& target,
     const std::string_view& flag,
     const std::source_location location = std::source_location::current())
 {
     add_target_compile_flags(target, {flag}, location);
+    
 }
 
 Meta prepare_new_meta_for_file(const std::filesystem::path& source_file, const std::string& flags)
@@ -281,7 +290,7 @@ void link_target(const Target& target, const bool use_build_dir = true, const st
     std::system(job.c_str());  // todo: replace system with something more sophisticated (to let parallel execution)
 }
 
-void build_target(const std::string_view& target, const std::source_location location = std::source_location::current())
+void build_target(Target& target, const std::source_location location = std::source_location::current())
 {
     if (clean_mode)
     {
@@ -289,11 +298,10 @@ void build_target(const std::string_view& target, const std::source_location loc
     }
     else 
     {
-        auto& found_target = get_target(target, location);
         const bool USE_BUILD_DIR {true};
 
-        compile_target(found_target, USE_BUILD_DIR, location);
-        link_target(found_target, USE_BUILD_DIR, location);
+        compile_target(target, USE_BUILD_DIR, location);
+        link_target(target, USE_BUILD_DIR, location);
     }
 }
 
