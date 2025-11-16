@@ -1,0 +1,28 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        test-dir: ['tests/one_file', 'tests/simple_demo']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y g++
+    
+    - name: Run ${{ matrix.test-dir }} tests
+      run: |
+        cd ${{ matrix.test-dir }}
+        bash test.sh
