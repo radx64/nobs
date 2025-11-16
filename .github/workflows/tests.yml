@@ -21,12 +21,16 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y g++-15
-    
+
+    - name: Use g++-15 as default
+      run: |
+        sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 100
+        sudo update-alternatives --set g++ /usr/bin/g++-15
+
+    - name: Verify version
+      run: g++ --version
+      
     - name: Run ${{ matrix.test-dir }} tests
       run: |
-        export CC=gcc-15
-        export CXX=g++-15
-        alias g++=g++-15
-        alias gcc=gcc-15
         cd ${{ matrix.test-dir }}
         bash test.sh
