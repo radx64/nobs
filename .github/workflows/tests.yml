@@ -20,15 +20,19 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y g++-15
+        sudo apt-get install -y gcc-15 g++-15
 
     - name: Use g++-15 as default
       run: |
-        sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 100
-        sudo update-alternatives --set g++ /usr/bin/g++-15
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 100 \
+                                   --slave /usr/bin/g++ g++ /usr/bin/g++-15
+          sudo update-alternatives --set gcc /usr/bin/gcc-15
+          sudo update-alternatives --set g++ /usr/bin/g++-15
 
     - name: Verify version
-      run: g++ --version
+      run: |
+          gcc --version
+          g++ --version
       
     - name: Run ${{ matrix.test-dir }} tests
       run: |
