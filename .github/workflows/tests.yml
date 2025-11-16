@@ -26,5 +26,7 @@ jobs:
       run: |
         export CC=gcc-15
         export CXX=g++-15
+        alias g++=g++-15
+        alias gcc=gcc-15
         cd ${{ matrix.test-dir }}
         bash test.sh
