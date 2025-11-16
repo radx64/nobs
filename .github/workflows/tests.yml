@@ -1,6 +1,14 @@
 name: Run Tests
 
-on:
+ 
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  CC: gcc-14
+  CXX: g++-14
   push:
     branches: [ main, develop ]
   pull_request:
