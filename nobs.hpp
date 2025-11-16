@@ -8,6 +8,7 @@
 #include <string_view>
 #include <string>
 #include <vector>
+#include <variant>
 #include <unistd.h>
 #include <utility>
 
@@ -19,14 +20,45 @@ namespace nobs
     constexpr auto RESET_FONT = "\033[0m";
     constexpr auto RED_FONT   = "\033[31;1m";
     constexpr auto GREEN_FONT = "\033[32;1m";
+    constexpr auto GREEN_FONT_FAINT = "\033[32;2m";
     constexpr auto YELLOW_FONT = "\033[33;1m";
     constexpr auto BLUE_FONT  = "\033[34;1m";
+
+struct CompileJob
+{
+    std::filesystem::path source_file;
+    std::filesystem::path object_file;
+    std::string compile_flags;
+    uint64_t source_timestamp;
+};
+
+bool operator==(const CompileJob& lhs, const CompileJob& rhs)
+{
+    return lhs.source_file == rhs.source_file and
+        lhs.object_file == rhs.object_file and
+        lhs.compile_flags == rhs.compile_flags and
+        lhs.source_timestamp == rhs.source_timestamp;
+}
+
+struct LinkJob
+{
+    std::vector<std::filesystem::path> object_files;
+    std::filesystem::path target_file;
+    std::string link_flags;
+};
+
+struct Job
+{
+    std::variant<CompileJob, LinkJob> specific_job;
+    // TODO add dependencies between jobs (eg to link target after all files are compiled)
+};
 
 struct Target
 {
     std::string name;
     std::vector<std::filesystem::path> sources;
     std::vector<std::string> compile_flags;
+    std::vector<Job> build_jobs{};
     bool needs_linking {false};
 
     Target() = default;
@@ -40,26 +72,6 @@ protected:
     Target& operator=(const Target& rhs) = default;
 };
 
-struct Meta
-{
-    uint64_t timestamp;
-    std::string compile_flags;
-
-    void operator=(const Meta& rhs);
-};
-
-bool operator==(const Meta& lhs, const Meta& rhs)
-{
-    return (lhs.timestamp == rhs.timestamp) 
-        and (lhs.compile_flags == rhs.compile_flags);
-}
-
-void Meta::operator=(const Meta& rhs)
-{
-    timestamp = rhs.timestamp;
-    compile_flags = rhs.compile_flags;
-}
-
 static std::vector<Target> targets {};
 static std::filesystem::path build_directory {"./build_dir"};  // build in "build_dir" by default
 static std::filesystem::path project_directory {std::filesystem::current_path()};
@@ -70,6 +82,11 @@ void set_project_directory(const std::string_view& project_dir)
     project_directory = std::filesystem::path(project_dir);
 }
 
+std::string current_project_directory()
+{
+    return project_directory.string();
+}
+
 void set_build_directory(const std::string_view& build_dir)
 {
     build_directory = std::string(build_dir);
@@ -77,7 +94,7 @@ void set_build_directory(const std::string_view& build_dir)
 
 void trace_error(const std::string_view& error_string, const std::source_location location = std::source_location::current())
 {
-    std::println("Error at {}:{}: {}", location.file_name(), location.line(), error_string);
+    std::println("{}Error at {}:{}: {}{}", RED_FONT, location.file_name(), location.line(), error_string, RESET_FONT);
 }
 
 Target& add_executable(const std::string_view& name)
@@ -98,29 +115,21 @@ void create_directory_if_missing(const std::filesystem::path directory)
     }
 }
 
-// Todo this might be removed later if not needed
-auto& get_target(const std::string_view& target, const std::source_location location = std::source_location::current())
-{
-    auto view = targets 
-        | std::views::filter([&](Target& t) {return t.name == target;})
-        | std::views::take(1);
-
-    if (view.empty())
-    {
-        trace_error(std::format("No target with name \"{}\" found! Exiting!", target), location);
-        exit(-1);
-    }
-
-    return view.front();
-}
-
 void add_target_sources(Target& target, 
     const std::vector<std::string_view>& sources, 
     const std::source_location location = std::source_location::current())
 {
     for (const auto& source : sources)
     {
-        target.sources.push_back(std::filesystem::path(source));
+        if (std::filesystem::exists(source))
+        {
+            target.sources.push_back(std::filesystem::path(source));
+        }
+        else
+        {
+            trace_error(std::format("Source file {} does not exist!", source), location);
+            exit(1);
+        }
     }
 }
 
@@ -149,35 +158,33 @@ void add_target_compile_flag(Target& target,
     
 }
 
-Meta prepare_new_meta_for_file(const std::filesystem::path& source_file, const std::string& flags)
+CompileJob read_compile_job_from_file(const std::filesystem::path& job_metafile)
 {
-    Meta meta{};
-    auto source_timestamp = std::filesystem::last_write_time(source_file);
-    meta.timestamp = static_cast<uint64_t>(source_timestamp.time_since_epoch().count());
-    meta.compile_flags = flags;
-    return meta;
-}
+    std::string job_metafile_name = job_metafile.string();
+    std::ifstream file{job_metafile_name};
 
-Meta read_meta_info_from_file(const std::filesystem::path& metafile)
-{
-   Meta meta{};
-   std::ifstream file{metafile.c_str()};
-
-   if (not file)
-   {
-        trace_error("Error opening file!");
+    if (not file)
+    {
+        trace_error(std::format("Error opening file {}", job_metafile_name), std::source_location::current());
         exit(1);
-   }
+    }
+
+    CompileJob job{};
 
     std::string line{};
 
-    if (not std::getline(file, line)) trace_error(std::format("Could not read timestamp from metafile {}", metafile.string()));
-    meta.timestamp = std::stoull(line.c_str());
+    if (not std::getline(file, line)) trace_error(std::format("Could not read source file from metafile {}", job_metafile_name));
+    job.source_file = line.c_str();
 
-    if (not std::getline(file, line)) trace_error(std::format("Could not read compiler flags from metafile {}", metafile.string()));
-    meta.compile_flags = line.c_str();
+    if (not std::getline(file, line)) trace_error(std::format("Could not read object source file from metafile {}", job_metafile_name));
+    job.object_file = line.c_str();
 
-    return meta;
+    if (not std::getline(file, line)) trace_error(std::format("Could not read compiler flags from metafile {}", job_metafile_name));
+    job.compile_flags = line.c_str();
+
+    if (not std::getline(file, line)) trace_error(std::format("Could not read timestamp from metafile {}", job_metafile_name));
+    job.source_timestamp = std::stoull(line.c_str());
+    return job;
 }
 
 auto get_file_metafile_name(const std::filesystem::path& source_file, const std::filesystem::path& build_source_path)
@@ -188,22 +195,49 @@ auto get_file_metafile_name(const std::filesystem::path& source_file, const std:
     return meta_file;
 }
 
-void make_meta_file(const std::filesystem::path& source_file, const std::filesystem::path& build_source_path, const Meta& meta_info)
+void write_compile_job_to_file(const CompileJob& compile_job)
 {
-    auto meta_file = get_file_metafile_name(source_file, build_source_path);
+    auto meta_file = compile_job.object_file.string() + ".meta";
 
     if (std::ofstream file{meta_file.c_str()}; file) {
-        std::println(file, "{}", meta_info.timestamp);
-        std::println(file, "{}", meta_info.compile_flags);
+        std::println(file, "{}", compile_job.source_file.string());
+        std::println(file, "{}", compile_job.object_file.string());
+        std::println(file, "{}", compile_job.compile_flags);
+        std::println(file, "{}", compile_job.source_timestamp);
     } else {
         trace_error("Error opening file!");
         exit(-1);
     } 
 }
 
-void compile_file(Target& target, const std::string& flags, const bool use_build_dir, const std::filesystem::path& source)
+uint64_t get_file_timestamp(const std::filesystem::path& filename)
 {
-    auto build_source_file = build_directory / source;
+    if (std::filesystem::exists(filename))
+    {
+        return static_cast<uint64_t>(std::filesystem::last_write_time(filename).time_since_epoch().count());
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+void prepare_file_compilation(Target& target, const std::string& flags, const bool use_build_dir, const std::filesystem::path& source)
+{
+    create_directory_if_missing(build_directory);
+    auto canonical_build_dir = std::filesystem::canonical(build_directory);
+
+    std::filesystem::path relative_source_path{};
+    if (source.is_absolute())
+    {
+        relative_source_path = std::filesystem::relative(source, project_directory);
+    }
+    else
+    {
+        relative_source_path = source;
+    }
+
+    auto build_source_file = canonical_build_dir / relative_source_path;
     auto build_source_path = build_source_file.parent_path();
 
     if (use_build_dir)  
@@ -217,40 +251,35 @@ void compile_file(Target& target, const std::string& flags, const bool use_build
     }
 
     auto object_file = std::filesystem::canonical(build_source_path);
+
     object_file /= source.filename();
     object_file += ".o";
 
-    auto meta_file = get_file_metafile_name(source, build_source_path);
-
-    auto new_file_meta_info = prepare_new_meta_for_file(source, flags);
-
-    if (std::filesystem::exists(meta_file))
+    auto metafile_name = get_file_metafile_name(object_file, build_source_path);
+    
+    CompileJob new_compile_job{
+        .source_file = relative_source_path,
+        .object_file = object_file,
+        .compile_flags = flags,
+        .source_timestamp = get_file_timestamp(source),
+    };
+    
+    if (std::filesystem::exists(metafile_name))
     {
-        auto old = read_meta_info_from_file(meta_file);
-
-        if (old == new_file_meta_info)
+        auto old_compile_job = read_compile_job_from_file(metafile_name);
+        if (old_compile_job == new_compile_job)
         {
-            std::println("Source not changed. No need to build {}", std::filesystem::canonical(source).string());
+            // TODO add verbosity level to print that file is up to date
             return;
         }
     }
 
     target.needs_linking = true;
-    
-    auto compile_parameters = std::format("-c -o {0} {1}", object_file.string(), 
-        std::filesystem::canonical(source).string());
-
-    auto job = std::format("{} {}{}", compiler, flags, compile_parameters);
-    std::println("{}", job);
-    std::system(job.c_str());  // todo: replace system with something more sophisticated (to let parallel execution)
-                                // also stop on fail need to be implemented
-
-    make_meta_file(source, build_source_path, new_file_meta_info);
+    target.build_jobs.push_back(Job{new_compile_job});
 }
 
-void compile_target(Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
+void prepare_target_compilation(Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
 {
-    std::println("{}Compiling target: {}{}", GREEN_FONT, target.name, RESET_FONT);
     create_directory_if_missing(build_directory);
     
     std::string flags{};
@@ -261,33 +290,98 @@ void compile_target(Target& target, const bool use_build_dir = true, const std::
 
     for (const auto& source : target.sources)
     {    
-        compile_file(target, flags, use_build_dir, source);
+        prepare_file_compilation(target, flags, use_build_dir, source);
     }
 }
 
-void link_target(const Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
+void prepare_target_linking(Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
 {
-    std::println("{}Linking target: {}{}", RED_FONT, target.name, RESET_FONT);
     if (not target.needs_linking)
     {
-        std::println("{}No need to relink {}{}", BLUE_FONT, target.name, RESET_FONT);
         return;
     }
 
     auto canonical_build_dir = std::filesystem::canonical(build_directory);
     if (not use_build_dir) canonical_build_dir = std::filesystem::canonical(".");
 
-    auto link_parameters = std::format("-o {}", (canonical_build_dir / target.name).string());
+    auto link_job = LinkJob{};
 
     for (const auto& source : target.sources)
     {
-        auto build_source_object_file = (canonical_build_dir / source) += ".o";
-        link_parameters.append(std::string(" ") + build_source_object_file.string());
+        // Determine object file path
+        std::filesystem::path relative_source_path{};
+        if (source.is_absolute())
+        {
+            relative_source_path = std::filesystem::relative(source, project_directory);
+        }
+        else
+        {
+            relative_source_path = source;
+        }
+
+        auto build_source_object_file = (canonical_build_dir / relative_source_path) += ".o";
+        link_job.object_files.push_back(build_source_object_file);
     }
 
-    auto job = std::format("{} {}", linker, link_parameters);
-    std::println("{}", job);
-    std::system(job.c_str());  // todo: replace system with something more sophisticated (to let parallel execution)
+    link_job.target_file = (canonical_build_dir / target.name);
+    link_job.link_flags = ""; // TODO add link flags support to Target
+    target.build_jobs.push_back(Job{.specific_job = link_job});
+}
+
+void run_build(const Target& target)
+{
+    auto jobs_count = target.build_jobs.size();
+    if (jobs_count == 0)
+    {
+        std::println("{}Nothing to build for target {}{}{}.{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, RESET_FONT);
+        return;
+    }
+    std::println("{}Running build of {}{}{} with {} jobs...{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, jobs_count, RESET_FONT);
+    for (const auto& [index, job] : std::views::enumerate(target.build_jobs))
+    {  
+        auto is_compile_job = std::holds_alternative<CompileJob>(job.specific_job);
+
+        auto percent = static_cast<int>((index + 1) * 100 / jobs_count);
+        std::string type{};
+        auto color = RED_FONT;
+        std::string command{};
+
+        if (is_compile_job)
+        {
+            type = "Compliling";
+            color = GREEN_FONT_FAINT;
+            auto specific_job = std::get<CompileJob>(job.specific_job);
+            command = std::format("{} {} -c -o {} {}", compiler, specific_job.compile_flags, specific_job.object_file.string(), specific_job.source_file.string());
+        }
+        else
+        {
+            type = "Linking";
+            color = GREEN_FONT;
+            auto specific_job = std::get<LinkJob>(job.specific_job);
+            auto link_objects = std::string{};
+
+            for (const auto& object : specific_job.object_files)
+            {
+                link_objects.append(std::string(" ") + object.string());
+            }
+
+            command = std::format("{} -o {} {} ", compiler, specific_job.target_file.string(), link_objects);
+        }
+
+        std::println("[{:3}%] {}/{} {}{} {}{}", percent, index+1, jobs_count, color, type, command, RESET_FONT);
+        auto result = std::system(command.c_str());  // todo: replace system with something more sophisticated (to let parallel execution)
+        if (result != 0)
+        {
+            std::println("{}Error: Command failed with code {}. Stopping build.{}", RED_FONT, result, RESET_FONT);
+            exit(result);
+        }
+        
+        if (is_compile_job)
+        {
+            auto specific_job = std::get<CompileJob>(job.specific_job);
+            write_compile_job_to_file(specific_job);
+        }
+    }
 }
 
 void build_target(Target& target, const std::source_location location = std::source_location::current())
@@ -300,14 +394,15 @@ void build_target(Target& target, const std::source_location location = std::sou
     {
         const bool USE_BUILD_DIR {true};
 
-        compile_target(target, USE_BUILD_DIR, location);
-        link_target(target, USE_BUILD_DIR, location);
+        prepare_target_compilation(target, USE_BUILD_DIR, location);
+        prepare_target_linking(target, USE_BUILD_DIR, location);
+        run_build(target);
     }
 }
 
 void restart_itself(const std::string& binary_name)
 {
-    std::println("Restarting with new binary: {}", binary_name);
+    std::println("{}Restarting with new binary: {}{}{}", YELLOW_FONT, RED_FONT, binary_name, RESET_FONT);
     execl(binary_name.c_str(), binary_name.c_str(), (char*)nullptr);
     exit(0);
 }
@@ -331,56 +426,29 @@ void clean_target_build_artifacts(const Target& target, const bool use_build_dir
     }
 }
 
-void self_rebuild(const std::filesystem::path& nobs_build_script_source_file, const Meta& meta_info)
-{
-    Target nobs_target;
-    nobs_target.name = nobs_build_script_source_file.filename().stem();
-    nobs_target.compile_flags.push_back("--std=c++23");
-    nobs_target.compile_flags.push_back("-I ../..");
-    nobs_target.needs_linking = true;
-    nobs_target.sources.push_back(nobs_build_script_source_file.filename());
-
-    const bool DONT_USE_BUILD_DIR {false};
-    compile_target(nobs_target, DONT_USE_BUILD_DIR);
-    link_target(nobs_target, DONT_USE_BUILD_DIR);
-    clean_target_build_artifacts(nobs_target, DONT_USE_BUILD_DIR);
-
-    make_meta_file(nobs_build_script_source_file, build_directory.parent_path(), meta_info);
-    std::println("Build binary rebuilt. Restarting build application!");
-    restart_itself(nobs_target.name);
-}
 
 void enable_self_rebuild(const std::source_location& location = std::source_location::current())
 {
-    std::filesystem::path nobs_build_script_source{location.file_name()};
+    std::filesystem::path nobs_build_script_source {location.file_name()};
     std::println("{}Nobs self rebuild active. File {} will be checked for changes every time build process is run {}", 
         YELLOW_FONT, std::filesystem::canonical(nobs_build_script_source).string(), RESET_FONT);
 
-    auto new_nobs_source_meta = prepare_new_meta_for_file(nobs_build_script_source, "--std=c++23");
+    auto& nobs_executable = add_executable(nobs_build_script_source.filename().stem().string());
     
-    auto old_nobs_source_meta_filename = get_file_metafile_name(nobs_build_script_source, ".");
+    add_target_source(nobs_executable, nobs_build_script_source.string());
+    add_target_compile_flag(nobs_executable, "--std=c++23");
+    const bool DONT_USE_BUILD_DIR {false};
+    prepare_target_compilation(nobs_executable, DONT_USE_BUILD_DIR);
+    prepare_target_linking(nobs_executable, DONT_USE_BUILD_DIR);
 
-    if (std::filesystem::exists(old_nobs_source_meta_filename))
+    if (nobs_executable.needs_linking == false)
     {
-        auto old_meta = read_meta_info_from_file(old_nobs_source_meta_filename);
-
-        if (old_meta == new_nobs_source_meta)
-        {
-            std::println("Nobs itself does not neeed to be rebuilt.");
-            return;
-        }
-        else
-        {
-            std::println("There are changes in build script so build application will be rebuild.");
-            self_rebuild(nobs_build_script_source, new_nobs_source_meta);
-        }
+        std::println("{}Nobs build script has not changed. No need to rebuild.{}", GREEN_FONT, RESET_FONT);
+        return;
     }
-    else
-    {
-        std::println("Nobs meta data not present. Assuming first run.");
-        make_meta_file(nobs_build_script_source, build_directory.parent_path(), new_nobs_source_meta);
-    }
-
+    run_build(nobs_executable);
+    clean_target_build_artifacts(nobs_executable, DONT_USE_BUILD_DIR);
+    restart_itself(nobs_executable.name);
 }
 
 void enable_command_line_params(const int argc, const char* argv[])
@@ -401,24 +469,6 @@ void enable_command_line_params(const int argc, const char* argv[])
     {
         clean_mode = true;
     }
-}
-
-void DEBUG_list()
-{
-    std::println("Project_dir:\t{}", std::filesystem::canonical(project_directory).string());
-    std::println("Build_dir:\t{}", build_directory.string());
-
-    for (const auto& t : targets)
-    {
-        std::println("Target:\t\t{}", t.name);
-        std::println("\nSources:");
-
-        for (const auto& s : t.sources)
-        {
-            std::println("\t\t{}", std::filesystem::canonical(s).string());
-        }
-    }
-
 }
 
 }  // namespace nobs
