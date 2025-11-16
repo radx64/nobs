@@ -6,14 +6,6 @@ on:
   pull_request:
     branches: [ main, develop ]
 
-env:
-  CC: gcc-14
-  CXX: g++-14
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main, develop ]
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -32,5 +24,8 @@ jobs:
     
     - name: Run ${{ matrix.test-dir }} tests
       run: |
+        echo "CC=gcc-14" >> $GITHUB_ENV
+        echo "CXX=g++-14" >> $GITHUB_ENV
+        echo "export CC CXX" >> $GITHUB_ENV
         cd ${{ matrix.test-dir }}
         bash test.sh
