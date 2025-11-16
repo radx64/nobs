@@ -24,8 +24,7 @@ jobs:
     
     - name: Run ${{ matrix.test-dir }} tests
       run: |
-        echo "CC=gcc-14" >> $GITHUB_ENV
-        echo "CXX=g++-14" >> $GITHUB_ENV
-        echo "export CC CXX" >> $GITHUB_ENV
+        echo "export CC=gcc-14" >> $GITHUB_ENV
+        echo "export CXX=g++-14" >> $GITHUB_ENV
         cd ${{ matrix.test-dir }}
         bash test.sh
