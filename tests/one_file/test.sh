@@ -1,6 +1,6 @@
 set -e
 echo "Building nobs"
-g++ -g --std=gnu++23 -I ../../ -o ./build build.cpp
+g++ -g -std=gnu++23 -I ../../ -o ./build build.cpp
 echo "Running build"
 ./build
 echo "Running built application"
