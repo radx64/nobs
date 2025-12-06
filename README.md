@@ -41,8 +41,8 @@ Check out the `tests/simple_demo` directory for example usage and project config
 - [x] Add self rebuilding capability
 - [x] Clean build dir as parameter support
 - [ ] Linking parameters support
-- [ ] Dependency graph support (build ordering of files)
-- [ ] Parallel translation units compilation support
+- [x] Dependency graph support (build ordering of files)
+- [x] Parallel translation units compilation support
 - [ ] Static and shared libraries support
 - [ ] Windows support
 

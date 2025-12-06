@@ -12,7 +12,7 @@ jobs:
     
     strategy:
       matrix:
-        test-dir: ['tests/one_file', 'tests/simple_demo']
+        test-dir: ['tests/one_file', 'tests/simple_demo', 'tests/include_directories']
     
     steps:
     - uses: actions/checkout@v4

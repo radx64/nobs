@@ -8,6 +8,7 @@
 #include <string_view>
 #include <string>
 #include <sstream>
+#include <thread>
 #include <vector>
 #include <variant>
 #include <unistd.h>
@@ -61,7 +62,9 @@ struct LinkJob
 struct Job
 {
     std::variant<CompileJob, LinkJob> specific_job;
-    // TODO add dependencies between jobs (eg to link target after all files are compiled)
+    std::vector<size_t> depends_on;  // indices of jobs this job depends on
+    enum class Status { Pending, Running, Completed, Failed } status = Status::Pending;
+    int exit_code = 0;
 };
 
 struct Target
@@ -87,6 +90,14 @@ static std::vector<Target> targets {};
 static std::filesystem::path build_directory {default_build_directory};  // build in "build_dir" by default
 static std::filesystem::path project_directory {std::filesystem::current_path()};
 static bool clean_mode{false};
+static size_t parallel_jobs = std::thread::hardware_concurrency();
+
+struct InFlightJob {
+    size_t job_index;
+    pid_t pid;
+    std::string command_display;
+    bool is_compile_job;
+};
 
 void set_compiler(const std::string_view& compiler_name)
 {
@@ -96,6 +107,11 @@ void set_compiler(const std::string_view& compiler_name)
 void set_linker(const std::string_view& linker_name)
 {
     linker = std::string(linker_name);
+}
+
+void set_parallel_jobs(size_t num_jobs)
+{
+    parallel_jobs = num_jobs > 0 ? num_jobs : 1;
 }
 
 void set_project_directory(const std::string_view& project_dir)
@@ -124,7 +140,7 @@ int execute_command(const std::vector<std::string>& args)
     if (pid == -1)
     {
         trace_error("Failed to fork process");
-        return -1;
+        exit(-1);
     }
 
     if (pid == 0)
@@ -153,6 +169,7 @@ int execute_command(const std::vector<std::string>& args)
         }
         else
         {
+            trace_error("Child process did not terminate normally");
             return -1;
         }
     }
@@ -161,6 +178,19 @@ int execute_command(const std::vector<std::string>& args)
 Target& add_executable(const std::string_view& name)
 {
     return targets.emplace_back(name);
+}
+
+bool are_dependencies_satisfied(const std::vector<Job>& jobs, size_t job_index)
+{
+    const auto& job = jobs[job_index];
+    for (size_t dep_index : job.depends_on)
+    {
+        if (jobs[dep_index].status != Job::Status::Completed)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 void create_directory_if_missing(const std::filesystem::path& directory)
@@ -395,10 +425,17 @@ void prepare_target_linking(Target& target, const bool use_build_dir = true)
 
     link_job.target_file = (canonical_build_dir / target.name);
     link_job.link_flags = ""; // TODO add link flags support to Target
-    target.build_jobs.push_back(Job{.specific_job = link_job});
+    
+    // Link job depends on all compile jobs
+    Job link_job_with_deps{.specific_job = link_job};
+    for (size_t i = 0; i < target.build_jobs.size(); ++i)
+    {
+        link_job_with_deps.depends_on.push_back(i);
+    }
+    target.build_jobs.push_back(link_job_with_deps);
 }
 
-void run_build(const Target& target)
+void run_build(Target& target)
 {
     const auto jobs_count = target.build_jobs.size();
     if (jobs_count == 0)
@@ -406,69 +443,164 @@ void run_build(const Target& target)
         std::println("{}Nothing to build for target {}{}{}.{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, RESET_FONT);
         return;
     }
-    std::println("{}Running build of {}{}{} with {} jobs...{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, jobs_count, RESET_FONT);
-    for (const auto& [index, job] : std::views::enumerate(target.build_jobs))
-    {  
-        auto is_compile_job = std::holds_alternative<CompileJob>(job.specific_job);
-
-        auto percent = static_cast<int>((index + 1) * 100 / jobs_count);
-        std::string type{};
-        auto color = RED_FONT;
-        std::vector<std::string> command_args{};
-
-        if (is_compile_job)
+    std::println("{}Running build of {}{}{} with {} jobs (max {} parallel)...{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, jobs_count, parallel_jobs, RESET_FONT);
+    
+    std::vector<InFlightJob> in_flight_jobs;
+    size_t completed_jobs = 0;
+    
+    // Process jobs while respecting dependencies with parallelization
+    while (completed_jobs < jobs_count)
+    {
+        // Check for completed child processes and mark jobs as completed
+        for (auto it = in_flight_jobs.begin(); it != in_flight_jobs.end(); )
         {
-            type = "Compliling";
-            color = GREEN_FONT_FAINT;
-            auto specific_job = std::get<CompileJob>(job.specific_job);
+            int status;
+            pid_t result = waitpid(it->pid, &status, WNOHANG);
             
-            command_args.push_back(compiler);
-            // Split compile_flags by spaces
-            std::istringstream iss(specific_job.compile_flags);
-            std::string flag;
-            while (iss >> flag)
+            if (result == it->pid)  // Child process completed
             {
-                command_args.push_back(flag);
+                auto& job = target.build_jobs[it->job_index];
+                int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                job.exit_code = exit_code;
+                
+                if (exit_code != 0)
+                {
+                    job.status = Job::Status::Failed;
+                    std::println("{}Error: Command failed with code {}. Stopping build.{}", RED_FONT, exit_code, RESET_FONT);
+                    exit(exit_code);
+                }
+                
+                job.status = Job::Status::Completed;
+                completed_jobs++;
+                
+                if (it->is_compile_job)
+                {
+                    auto specific_job = std::get<CompileJob>(job.specific_job);
+                    write_compile_job_to_file(specific_job);
+                }
+                
+                it = in_flight_jobs.erase(it);
             }
-            command_args.push_back(compile_flag);
-            command_args.push_back(compile_output_flag);
-            command_args.push_back(specific_job.object_file.string());
-            command_args.push_back(specific_job.source_file.string());
-        }
-        else
-        {
-            type = "Linking";
-            color = GREEN_FONT;
-            auto specific_job = std::get<LinkJob>(job.specific_job);
-            
-            command_args.push_back(compiler);
-            command_args.push_back(linker_output_flag);
-            command_args.push_back(specific_job.target_file.string());
-            for (const auto& object : specific_job.object_files)
+            else
             {
-                command_args.push_back(object.string());
+                ++it;
             }
-        }
-
-        // Display command for user information
-        std::string command_display{};
-        for (const auto& arg : command_args)
-        {
-            command_display += arg + " ";
-        }
-        std::println("[{:3}%] {}/{} {}{} {}{}", percent, index+1, jobs_count, color, type, command_display, RESET_FONT);
-        
-        int result = execute_command(command_args);
-        if (result != 0)
-        {
-            std::println("{}Error: Command failed with code {}. Stopping build.{}", RED_FONT, result, RESET_FONT);
-            exit(result);
         }
         
-        if (is_compile_job)
+        // Spawn new jobs if we have capacity and dependencies are satisfied
+        while (in_flight_jobs.size() < parallel_jobs && completed_jobs + in_flight_jobs.size() < jobs_count)
         {
-            auto specific_job = std::get<CompileJob>(job.specific_job);
-            write_compile_job_to_file(specific_job);
+            bool found_ready_job = false;
+            
+            for (size_t index = 0; index < jobs_count; ++index)
+            {
+                auto& job = target.build_jobs[index];
+                
+                // Skip if not pending
+                if (job.status != Job::Status::Pending)
+                {
+                    continue;
+                }
+                
+                // Check if dependencies are satisfied
+                if (!are_dependencies_satisfied(target.build_jobs, index))
+                {
+                    continue;
+                }
+                
+                found_ready_job = true;
+                auto is_compile_job = std::holds_alternative<CompileJob>(job.specific_job);
+
+                auto percent = static_cast<int>((completed_jobs + in_flight_jobs.size() + 1) * 100 / jobs_count);
+                std::string type{};
+                auto color = RED_FONT;
+                std::vector<std::string> command_args{};
+
+                if (is_compile_job)
+                {
+                    type = "Compiling";
+                    color = GREEN_FONT_FAINT;
+                    auto specific_job = std::get<CompileJob>(job.specific_job);
+                    
+                    command_args.push_back(compiler);
+                    // Split compile_flags by spaces
+                    std::istringstream iss(specific_job.compile_flags);
+                    std::string flag;
+                    while (iss >> flag)
+                    {
+                        command_args.push_back(flag);
+                    }
+                    command_args.push_back(compile_flag);
+                    command_args.push_back(compile_output_flag);
+                    command_args.push_back(specific_job.object_file.string());
+                    command_args.push_back(specific_job.source_file.string());
+                }
+                else
+                {
+                    type = "Linking";
+                    color = GREEN_FONT;
+                    auto specific_job = std::get<LinkJob>(job.specific_job);
+                    
+                    command_args.push_back(compiler);
+                    command_args.push_back(linker_output_flag);
+                    command_args.push_back(specific_job.target_file.string());
+                    for (const auto& object : specific_job.object_files)
+                    {
+                        command_args.push_back(object.string());
+                    }
+                }
+
+                // Display command for user information
+                std::string command_display{};
+                for (const auto& arg : command_args)
+                {
+                    command_display += arg + " ";
+                }
+                std::println("[{:3}%] {}/{} {}{} {}{}", percent, completed_jobs + in_flight_jobs.size() + 1, jobs_count, color, type, command_display, RESET_FONT);
+                
+                job.status = Job::Status::Running;
+                
+                // Fork and execute the command
+                pid_t pid = fork();
+                if (pid == -1)
+                {
+                    trace_error("Failed to fork process");
+                    exit(-1);
+                }
+
+                if (pid == 0)
+                {
+                    // Child process
+                    std::vector<char*> argv;
+                    for (const auto& arg : command_args)
+                    {
+                        argv.push_back(const_cast<char*>(arg.c_str()));
+                    }
+                    argv.push_back(nullptr);
+
+                    execvp(argv[0], argv.data());
+                    // If execvp returns, an error occurred
+                    trace_error("Failed to execute command");
+                    exit(-1);
+                }
+                else
+                {
+                    // Parent process - track the job
+                    in_flight_jobs.push_back({index, pid, command_display, is_compile_job});
+                    break;  // Go back to check for completions
+                }
+            }
+            
+            if (!found_ready_job)
+            {
+                break;  // No more ready jobs, wait for some to complete
+            }
+        }
+        
+        // If we have jobs in flight, wait a bit before checking again
+        if (!in_flight_jobs.empty())
+        {
+            usleep(10000);  // 10ms sleep to avoid busy-waiting
         }
     }
 }
@@ -544,20 +676,53 @@ void enable_command_line_params(const int argc, const char* argv[])
 {
     if (argc == 1) return;
 
-    auto first_param = std::string(argv[1]);
-
-    if (first_param == "--help" || first_param == "-h" )
+    for (int i = 1; i < argc; ++i)
     {
-        std::println("usage: {}", argv[0]);
-        std::println("  -c, --clean\t- cleans build artifacts");
-        std::println("  -h, --help\t- shows this help");
-        exit(0);
-    }
+        auto param = std::string(argv[i]);
 
-    if (first_param == "--clean" || first_param == "-c")
-    {
-        clean_mode = true;
+        if (param == "--help" || param == "-h")
+        {
+            std::println("usage: {}", argv[0]);
+            std::println("  -c, --clean\t- cleans build artifacts");
+            std::println("  -m, --jobs N\t- use N parallel jobs (default: {})", parallel_jobs);
+            std::println("  -h, --help\t- shows this help");
+            exit(0);
+        }
+        else if (param == "--clean" || param == "-c")
+        {
+            clean_mode = true;
+        }
+        else if (param == "--jobs" || param == "-m")
+        {
+            if (i + 1 < argc)
+            {
+                try
+                {
+                    size_t num_jobs = std::stoull(argv[i + 1]);
+                    set_parallel_jobs(num_jobs);
+                    ++i;  // Skip the next argument since we consumed it
+                }
+                catch (const std::exception& e)
+                {
+                    trace_error(std::format("Invalid number of jobs: {}", argv[i + 1]));
+                    exit(1);
+                }
+            }
+            else
+            {
+                trace_error("--jobs/-m requires an argument");
+                exit(1);
+            }
+        }
     }
+}
+
+void add_target_include_directories(Target& target, const std::vector<std::string_view>& include_dirs)
+{
+    for (const auto& dir : include_dirs)
+    {
+        target.compile_flags.push_back(std::format("-I{}", dir));
+    }    
 }
 
 }  // namespace nobs
