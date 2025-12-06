@@ -5,15 +5,15 @@
 #include <print>
 #include <ranges>
 #include <source_location>
+#include <sstream>
 #include <string_view>
 #include <string>
-#include <sstream>
+#include <sys/wait.h>
 #include <thread>
-#include <vector>
-#include <variant>
 #include <unistd.h>
 #include <utility>
-#include <sys/wait.h>
+#include <variant>
+#include <vector>
 
 namespace nobs
 {
@@ -92,12 +92,14 @@ static std::filesystem::path project_directory {std::filesystem::current_path()}
 static bool clean_mode{false};
 static size_t parallel_jobs = std::thread::hardware_concurrency();
 
-struct InFlightJob {
+struct PendingJob {
     size_t job_index;
     pid_t pid;
     std::string command_display;
     bool is_compile_job;
 };
+
+
 
 void set_compiler(const std::string_view& compiler_name)
 {
@@ -191,6 +193,58 @@ bool are_dependencies_satisfied(const std::vector<Job>& jobs, size_t job_index)
         }
     }
     return true;
+}
+
+// Print a single job status line. Extracted to improve readability.
+inline void print_job_status(int percent, size_t ordinal, size_t total, std::string_view color, std::string_view type, const std::string& command_display)
+{
+    std::println("[{:3}%] {}/{} {}{} {}{}", percent, ordinal, total, color, type, command_display, RESET_FONT);
+}
+
+// Build command arguments for a job. Returns (args, is_compile_job).
+inline std::pair<std::vector<std::string>, bool> build_job_command_args(const Job& job)
+{
+    std::vector<std::string> args;
+    if (std::holds_alternative<CompileJob>(job.specific_job))
+    {
+        auto specific_job = std::get<CompileJob>(job.specific_job);
+        args.push_back(compiler);
+        std::istringstream iss(specific_job.compile_flags);
+        std::string flag;
+        while (iss >> flag)
+        {
+            args.push_back(flag);
+        }
+        args.push_back(compile_flag);
+        args.push_back(compile_output_flag);
+        args.push_back(specific_job.object_file.string());
+        args.push_back(specific_job.source_file.string());
+        return {args, true};
+    }
+    else
+    {
+        auto specific_job = std::get<LinkJob>(job.specific_job);
+        args.push_back(compiler);
+        args.push_back(linker_output_flag);
+        args.push_back(specific_job.target_file.string());
+        for (const auto& object : specific_job.object_files)
+        {
+            args.push_back(object.string());
+        }
+        return {args, false};
+    }
+}
+
+inline std::string join_command_display(const std::vector<std::string>& args)
+{
+    std::string out;
+    for (const auto& a : args) { out += a; out += ' '; }
+    return out;
+}
+
+inline int compute_percent(size_t completed, size_t pending, size_t jobs_count)
+{
+    return static_cast<int>((completed + pending + 1) * 100 / jobs_count);
 }
 
 void create_directory_if_missing(const std::filesystem::path& directory)
@@ -445,14 +499,12 @@ void run_build(Target& target)
     }
     std::println("{}Running build of {}{}{} with {} jobs (max {} parallel)...{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, jobs_count, parallel_jobs, RESET_FONT);
     
-    std::vector<InFlightJob> in_flight_jobs;
+    std::vector<PendingJob> pending_jobs;
     size_t completed_jobs = 0;
     
-    // Process jobs while respecting dependencies with parallelization
     while (completed_jobs < jobs_count)
     {
-        // Check for completed child processes and mark jobs as completed
-        for (auto it = in_flight_jobs.begin(); it != in_flight_jobs.end(); )
+        for (auto it = pending_jobs.begin(); it != pending_jobs.end(); )
         {
             int status;
             pid_t result = waitpid(it->pid, &status, WNOHANG);
@@ -479,7 +531,7 @@ void run_build(Target& target)
                     write_compile_job_to_file(specific_job);
                 }
                 
-                it = in_flight_jobs.erase(it);
+                it = pending_jobs.erase(it);
             }
             else
             {
@@ -488,7 +540,7 @@ void run_build(Target& target)
         }
         
         // Spawn new jobs if we have capacity and dependencies are satisfied
-        while (in_flight_jobs.size() < parallel_jobs && completed_jobs + in_flight_jobs.size() < jobs_count)
+        while (pending_jobs.size() < parallel_jobs && completed_jobs + pending_jobs.size() < jobs_count)
         {
             bool found_ready_job = false;
             
@@ -507,59 +559,19 @@ void run_build(Target& target)
                 {
                     continue;
                 }
-                
+
                 found_ready_job = true;
-                auto is_compile_job = std::holds_alternative<CompileJob>(job.specific_job);
 
-                auto percent = static_cast<int>((completed_jobs + in_flight_jobs.size() + 1) * 100 / jobs_count);
-                std::string type{};
-                auto color = RED_FONT;
-                std::vector<std::string> command_args{};
+                auto [command_args, is_compile_job] = build_job_command_args(job);
+                auto percent = compute_percent(completed_jobs, pending_jobs.size(), jobs_count);
+                auto color = is_compile_job ? GREEN_FONT_FAINT : GREEN_FONT;
+                auto type = is_compile_job ? "Compiling" : "Linking";
 
-                if (is_compile_job)
-                {
-                    type = "Compiling";
-                    color = GREEN_FONT_FAINT;
-                    auto specific_job = std::get<CompileJob>(job.specific_job);
-                    
-                    command_args.push_back(compiler);
-                    // Split compile_flags by spaces
-                    std::istringstream iss(specific_job.compile_flags);
-                    std::string flag;
-                    while (iss >> flag)
-                    {
-                        command_args.push_back(flag);
-                    }
-                    command_args.push_back(compile_flag);
-                    command_args.push_back(compile_output_flag);
-                    command_args.push_back(specific_job.object_file.string());
-                    command_args.push_back(specific_job.source_file.string());
-                }
-                else
-                {
-                    type = "Linking";
-                    color = GREEN_FONT;
-                    auto specific_job = std::get<LinkJob>(job.specific_job);
-                    
-                    command_args.push_back(compiler);
-                    command_args.push_back(linker_output_flag);
-                    command_args.push_back(specific_job.target_file.string());
-                    for (const auto& object : specific_job.object_files)
-                    {
-                        command_args.push_back(object.string());
-                    }
-                }
+                std::string command_display = join_command_display(command_args);
+                print_job_status(percent, completed_jobs + pending_jobs.size() + 1, jobs_count, color, type, command_display);
 
-                // Display command for user information
-                std::string command_display{};
-                for (const auto& arg : command_args)
-                {
-                    command_display += arg + " ";
-                }
-                std::println("[{:3}%] {}/{} {}{} {}{}", percent, completed_jobs + in_flight_jobs.size() + 1, jobs_count, color, type, command_display, RESET_FONT);
-                
                 job.status = Job::Status::Running;
-                
+
                 // Fork and execute the command
                 pid_t pid = fork();
                 if (pid == -1)
@@ -586,7 +598,7 @@ void run_build(Target& target)
                 else
                 {
                     // Parent process - track the job
-                    in_flight_jobs.push_back({index, pid, command_display, is_compile_job});
+                    pending_jobs.push_back({index, pid, command_display, is_compile_job});
                     break;  // Go back to check for completions
                 }
             }
@@ -597,8 +609,8 @@ void run_build(Target& target)
             }
         }
         
-        // If we have jobs in flight, wait a bit before checking again
-        if (!in_flight_jobs.empty())
+        // If we have pending jobs, wait a bit before checking again
+        if (!pending_jobs.empty())
         {
             usleep(10000);  // 10ms sleep to avoid busy-waiting
         }
@@ -646,7 +658,6 @@ void clean_target_build_artifacts(const Target& target, const bool use_build_dir
         std::filesystem::remove(object_file);
     }
 }
-
 
 void enable_self_rebuild(const std::source_location& location = std::source_location::current())
 {
