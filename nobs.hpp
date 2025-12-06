@@ -15,7 +15,10 @@
 #include <variant>
 #include <vector>
 
-namespace nobs
+namespace nobs {struct Target;}
+
+
+namespace nobs::internal
 {
     static std::string compiler = "g++";
     static std::string linker = "g++";
@@ -69,13 +72,16 @@ struct Job
     enum class Status { Pending, Running, Completed, Failed } status = Status::Pending;
     int exit_code = 0;
 };
+} // namespace nobs::internal
 
+namespace nobs
+{
 struct Target
 {
     std::string name;
     std::vector<std::filesystem::path> sources;
     std::vector<std::string> compile_flags;
-    std::vector<Job> build_jobs{};
+    std::vector<internal::Job> build_jobs{};
     bool needs_linking {false};
 
     Target() = default;
@@ -88,6 +94,10 @@ protected:
     Target(const Target& rhs) = default;
     Target& operator=(const Target& rhs) = default;
 };
+}  // namespace nobs
+
+namespace nobs::internal
+{
 
 static std::vector<Target> targets {};
 static std::filesystem::path build_directory {default_build_directory};  // build in "build_dir" by default
@@ -102,39 +112,25 @@ struct PendingJob {
     bool is_compile_job;
 };
 
-void set_compiler(const std::string_view& compiler_name)
-{
-    compiler = std::string(compiler_name);
-}
-
-void set_linker(const std::string_view& linker_name)
-{
-    linker = std::string(linker_name);
-}
-
 void set_parallel_jobs(size_t num_jobs)
 {
     parallel_jobs = num_jobs > 0 ? num_jobs : 1;
 }
 
-void set_project_directory(const std::string_view& project_dir)
-{
-    project_directory = std::filesystem::path(project_dir);
-}
-
-std::string current_project_directory()
-{
-    return project_directory.string();
-}
-
-void set_build_directory(const std::string_view& build_dir)
-{
-    build_directory = std::string(build_dir);
-}
-
 void trace_error(const std::string_view& error_string, const std::source_location location = std::source_location::current())
 {
     std::println("{}Error at {}:{}: {}{}", RED_FONT, location.file_name(), location.line(), error_string, RESET_FONT);
+}
+
+inline std::vector<char*> build_argv(const std::vector<std::string>& args)
+{
+    std::vector<char*> argv;
+    for (const auto& arg : args)
+    {
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+    return argv;
 }
 
 int execute_command(const std::vector<std::string>& args)
@@ -172,11 +168,6 @@ int execute_command(const std::vector<std::string>& args)
     }
 }
 
-Target& add_executable(const std::string_view& name)
-{
-    return targets.emplace_back(name);
-}
-
 bool are_dependencies_satisfied(const std::vector<Job>& jobs, size_t job_index)
 {
     const auto& job = jobs[job_index];
@@ -188,17 +179,6 @@ bool are_dependencies_satisfied(const std::vector<Job>& jobs, size_t job_index)
         }
     }
     return true;
-}
-
-inline std::vector<char*> build_argv(const std::vector<std::string>& args)
-{
-    std::vector<char*> argv;
-    for (const auto& arg : args)
-    {
-        argv.push_back(const_cast<char*>(arg.c_str()));
-    }
-    argv.push_back(nullptr);
-    return argv;
 }
 
 inline void print_job_status(int percent, size_t ordinal, size_t total, std::string_view color, std::string_view type, const std::string& command_display)
@@ -262,47 +242,6 @@ void create_directory_if_missing(const std::filesystem::path& directory)
         trace_error(std::format("ERROR: got {} - code {}", error.what(), error.code().message()));
         throw;
     }
-}
-
-void add_target_sources(Target& target, 
-    const std::vector<std::string_view>& sources, 
-    const std::source_location location = std::source_location::current())
-{
-    for (const auto& source : sources)
-    {
-        if (std::filesystem::exists(source))
-        {
-            target.sources.push_back(std::filesystem::path(source));
-        }
-        else
-        {
-            trace_error(std::format("Source file {} does not exist!", source), location);
-            exit(1);
-        }
-    }
-}
-
-void add_target_source(Target& target,
-    const std::string_view& source, 
-    const std::source_location location = std::source_location::current())
-{
-    add_target_sources(target, {source}, location);
-}
-
-void add_target_compile_flags(Target& target,
-    const std::vector<std::string_view>& flags)
-{
-    for (const auto& flag : flags)
-    {
-        target.compile_flags.push_back(std::string(flag));
-    }    
-}
-
-void add_target_compile_flag(Target& target,
-    const std::string_view& flag)
-{
-    add_target_compile_flags(target, {flag});
-    
 }
 
 CompileJob read_compile_job_from_file(const std::filesystem::path& job_metafile)
@@ -613,22 +552,6 @@ void run_build(Target& target)
     }
 }
 
-void build_target(Target& target)
-{
-    if (clean_mode)
-    {
-        std::filesystem::remove_all(build_directory);
-    }
-    else 
-    {
-        const bool USE_BUILD_DIR {true};
-
-        prepare_target_compilation(target, USE_BUILD_DIR);
-        prepare_target_linking(target, USE_BUILD_DIR);
-        run_build(target);
-    }
-}
-
 void restart_itself(const std::string& binary_name)
 {
     std::println("{}Restarting with new binary: {}{}{}", YELLOW_FONT, RED_FONT, binary_name, RESET_FONT);
@@ -655,28 +578,28 @@ void clean_target_build_artifacts(const Target& target, const bool use_build_dir
     }
 }
 
-void enable_self_rebuild(const std::source_location& location = std::source_location::current())
+}  // namespace nobs::internal
+
+
+namespace nobs
 {
-    std::filesystem::path nobs_build_script_source {location.file_name()};
-    std::println("{}Nobs self rebuild active. File {} will be checked for changes every time build process is run {}", 
-        YELLOW_FONT, std::filesystem::canonical(nobs_build_script_source).string(), RESET_FONT);
 
-    auto& nobs_executable = add_executable(nobs_build_script_source.filename().stem().string());
-    
-    add_target_source(nobs_executable, nobs_build_script_source.string());
-    add_target_compile_flag(nobs_executable, default_cpp_standard);
-    const bool DONT_USE_BUILD_DIR {false};
-    prepare_target_compilation(nobs_executable, DONT_USE_BUILD_DIR);
-    prepare_target_linking(nobs_executable, DONT_USE_BUILD_DIR);
-
-    if (nobs_executable.needs_linking == false)
+void add_target_include_directories(Target& target, const std::vector<std::string_view>& include_dirs)
+{
+    for (const auto& dir : include_dirs)
     {
-        std::println("{}Nobs build script has not changed. No need to rebuild.{}", GREEN_FONT, RESET_FONT);
-        return;
-    }
-    run_build(nobs_executable);
-    clean_target_build_artifacts(nobs_executable, DONT_USE_BUILD_DIR);
-    restart_itself(nobs_executable.name);
+        target.compile_flags.push_back(std::format("-I{}", dir));
+    }    
+}
+
+void set_compiler(const std::string_view& compiler_name)
+{
+    internal::compiler = std::string(compiler_name);
+}
+
+void set_linker(const std::string_view& linker_name)
+{
+    internal::linker = std::string(linker_name);
 }
 
 void enable_command_line_params(const int argc, const char* argv[])
@@ -691,13 +614,13 @@ void enable_command_line_params(const int argc, const char* argv[])
         {
             std::println("usage: {}", argv[0]);
             std::println("  -c, --clean\t- cleans build artifacts");
-            std::println("  -m, --jobs N\t- use N parallel jobs (default: {})", parallel_jobs);
+            std::println("  -m, --jobs N\t- use N parallel jobs (default: {})", internal::parallel_jobs);
             std::println("  -h, --help\t- shows this help");
             exit(0);
         }
         else if (param == "--clean" || param == "-c")
         {
-            clean_mode = true;
+            internal::clean_mode = true;
         }
         else if (param == "--jobs" || param == "-m")
         {
@@ -706,30 +629,122 @@ void enable_command_line_params(const int argc, const char* argv[])
                 try
                 {
                     size_t num_jobs = std::stoull(argv[i + 1]);
-                    set_parallel_jobs(num_jobs);
+                    internal::set_parallel_jobs(num_jobs);
                     ++i;  // Skip the next argument since we consumed it
                 }
                 catch (const std::exception& e)
                 {
-                    trace_error(std::format("Invalid number of jobs: {}", argv[i + 1]));
+                    internal::trace_error(std::format("Invalid number of jobs: {}", argv[i + 1]));
                     exit(1);
                 }
             }
             else
             {
-                trace_error("--jobs/-m requires an argument");
+                internal::trace_error("--jobs/-m requires an argument");
                 exit(1);
             }
         }
     }
 }
 
-void add_target_include_directories(Target& target, const std::vector<std::string_view>& include_dirs)
+Target& add_executable(const std::string_view& name)
 {
-    for (const auto& dir : include_dirs)
+    return internal::targets.emplace_back(name);
+}
+
+void set_build_directory(const std::string_view& build_dir)
+{
+    internal::build_directory = std::string(build_dir);
+}
+
+void add_target_sources(Target& target, 
+    const std::vector<std::string_view>& sources, 
+    const std::source_location location = std::source_location::current())
+{
+    for (const auto& source : sources)
     {
-        target.compile_flags.push_back(std::format("-I{}", dir));
+        if (std::filesystem::exists(source))
+        {
+            target.sources.push_back(std::filesystem::path(source));
+        }
+        else
+        {
+            internal::trace_error(std::format("Source file {} does not exist!", source), location);
+            exit(1);
+        }
+    }
+}
+
+void add_target_source(Target& target,
+    const std::string_view& source, 
+    const std::source_location location = std::source_location::current())
+{
+    add_target_sources(target, {source}, location);
+}
+
+void add_target_compile_flags(Target& target,
+    const std::vector<std::string_view>& flags)
+{
+    for (const auto& flag : flags)
+    {
+        target.compile_flags.push_back(std::string(flag));
     }    
 }
 
-}  // namespace nobs
+void add_target_compile_flag(Target& target,
+    const std::string_view& flag)
+{
+    add_target_compile_flags(target, {flag});
+}
+
+void build_target(Target& target)
+{
+    if (internal::clean_mode)
+    {
+        std::filesystem::remove_all(internal::build_directory);
+    }
+    else 
+    {
+        const bool USE_BUILD_DIR {true};
+
+        internal::prepare_target_compilation(target, USE_BUILD_DIR);
+        internal::prepare_target_linking(target, USE_BUILD_DIR);
+        internal::run_build(target);
+    }
+}
+
+void enable_self_rebuild(const std::source_location& location = std::source_location::current())
+{
+    std::filesystem::path nobs_build_script_source {location.file_name()};
+    std::println("{}Nobs self rebuild active. File {} will be checked for changes every time build process is run {}", 
+        internal::YELLOW_FONT, std::filesystem::canonical(nobs_build_script_source).string(), internal::RESET_FONT);
+
+    auto& nobs_executable = add_executable(nobs_build_script_source.filename().stem().string());
+    
+    add_target_source(nobs_executable, nobs_build_script_source.string());
+    add_target_compile_flag(nobs_executable, internal::default_cpp_standard);
+    const bool DONT_USE_BUILD_DIR {false};
+    internal::prepare_target_compilation(nobs_executable, DONT_USE_BUILD_DIR);
+    internal::prepare_target_linking(nobs_executable, DONT_USE_BUILD_DIR);
+    if (nobs_executable.needs_linking == false)
+    {
+        std::println("{}Nobs build script has not changed. No need to rebuild.{}", internal::GREEN_FONT, internal::RESET_FONT);
+        return;
+    }
+    internal::run_build(nobs_executable);
+    internal::clean_target_build_artifacts(nobs_executable, DONT_USE_BUILD_DIR);
+    internal::restart_itself(nobs_executable.name);
+}
+
+void set_project_directory(const std::string_view& project_dir)
+{
+    internal::project_directory = std::filesystem::path(project_dir);
+}
+
+std::string current_project_directory()
+{
+    return internal::project_directory.string();
+}
+
+} // namespace nobs
+
