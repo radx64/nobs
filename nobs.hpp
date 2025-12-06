@@ -7,15 +7,17 @@
 #include <source_location>
 #include <string_view>
 #include <string>
+#include <sstream>
 #include <vector>
 #include <variant>
 #include <unistd.h>
 #include <utility>
+#include <sys/wait.h>
 
 namespace nobs
 {
-    auto constexpr compiler = "g++";
-    auto constexpr linker = "g++";
+    static std::string compiler = "g++";
+    static std::string linker = "g++";
 
     constexpr auto RESET_FONT = "\033[0m";
     constexpr auto RED_FONT   = "\033[31;1m";
@@ -23,6 +25,15 @@ namespace nobs
     constexpr auto GREEN_FONT_FAINT = "\033[32;2m";
     constexpr auto YELLOW_FONT = "\033[33;1m";
     constexpr auto BLUE_FONT  = "\033[34;1m";
+
+    constexpr auto metafile_extension = ".meta";
+    constexpr auto object_file_extension = ".o";
+    constexpr auto default_build_directory = "./build_dir";
+    constexpr auto default_cpp_standard = "--std=c++23";
+    constexpr auto current_directory = ".";
+    constexpr auto compile_flag = "-c";
+    constexpr auto compile_output_flag = "-o";
+    constexpr auto linker_output_flag = "-o";
 
 struct CompileJob
 {
@@ -73,9 +84,19 @@ protected:
 };
 
 static std::vector<Target> targets {};
-static std::filesystem::path build_directory {"./build_dir"};  // build in "build_dir" by default
+static std::filesystem::path build_directory {default_build_directory};  // build in "build_dir" by default
 static std::filesystem::path project_directory {std::filesystem::current_path()};
 static bool clean_mode{false};
+
+void set_compiler(const std::string_view& compiler_name)
+{
+    compiler = std::string(compiler_name);
+}
+
+void set_linker(const std::string_view& linker_name)
+{
+    linker = std::string(linker_name);
+}
 
 void set_project_directory(const std::string_view& project_dir)
 {
@@ -97,16 +118,56 @@ void trace_error(const std::string_view& error_string, const std::source_locatio
     std::println("{}Error at {}:{}: {}{}", RED_FONT, location.file_name(), location.line(), error_string, RESET_FONT);
 }
 
+int execute_command(const std::vector<std::string>& args)
+{
+    pid_t pid = fork();
+    if (pid == -1)
+    {
+        trace_error("Failed to fork process");
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        // Child process
+        std::vector<char*> argv;
+        for (const auto& arg : args)
+        {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        execvp(argv[0], argv.data());
+        // If execvp returns, an error occurred
+        trace_error("Failed to execute command");
+        exit(-1);
+    }
+    else
+    {
+        // Parent process
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status))
+        {
+            return WEXITSTATUS(status);
+        }
+        else
+        {
+            return -1;
+        }
+    }
+}
+
 Target& add_executable(const std::string_view& name)
 {
     return targets.emplace_back(name);
 }
 
-void create_directory_if_missing(const std::filesystem::path directory)
+void create_directory_if_missing(const std::filesystem::path& directory)
 {
     try
     { 
-        auto result = std::filesystem::create_directories(directory);
+        std::filesystem::create_directories(directory);
     }
     catch (std::filesystem::filesystem_error& error)
     {
@@ -141,8 +202,7 @@ void add_target_source(Target& target,
 }
 
 void add_target_compile_flags(Target& target,
-    const std::vector<std::string_view>& flags,
-    const std::source_location location = std::source_location::current())
+    const std::vector<std::string_view>& flags)
 {
     for (const auto& flag : flags)
     {
@@ -151,10 +211,9 @@ void add_target_compile_flags(Target& target,
 }
 
 void add_target_compile_flag(Target& target,
-    const std::string_view& flag,
-    const std::source_location location = std::source_location::current())
+    const std::string_view& flag)
 {
-    add_target_compile_flags(target, {flag}, location);
+    add_target_compile_flags(target, {flag});
     
 }
 
@@ -173,16 +232,28 @@ CompileJob read_compile_job_from_file(const std::filesystem::path& job_metafile)
 
     std::string line{};
 
-    if (not std::getline(file, line)) trace_error(std::format("Could not read source file from metafile {}", job_metafile_name));
+    if (not std::getline(file, line)) {
+        trace_error(std::format("Could not read source file from metafile {}", job_metafile_name));
+        exit(1);
+    }
     job.source_file = line.c_str();
 
-    if (not std::getline(file, line)) trace_error(std::format("Could not read object source file from metafile {}", job_metafile_name));
+    if (not std::getline(file, line)) {
+        trace_error(std::format("Could not read object source file from metafile {}", job_metafile_name));
+        exit(1);
+    }
     job.object_file = line.c_str();
 
-    if (not std::getline(file, line)) trace_error(std::format("Could not read compiler flags from metafile {}", job_metafile_name));
+    if (not std::getline(file, line)) {
+        trace_error(std::format("Could not read compiler flags from metafile {}", job_metafile_name));
+        exit(1);
+    }
     job.compile_flags = line.c_str();
 
-    if (not std::getline(file, line)) trace_error(std::format("Could not read timestamp from metafile {}", job_metafile_name));
+    if (not std::getline(file, line)) {
+        trace_error(std::format("Could not read timestamp from metafile {}", job_metafile_name));
+        exit(1);
+    }
     job.source_timestamp = std::stoull(line.c_str());
     return job;
 }
@@ -191,14 +262,13 @@ auto get_file_metafile_name(const std::filesystem::path& source_file, const std:
 {
     auto meta_file = std::filesystem::canonical(build_source_path);
     meta_file /= source_file.filename();
-    meta_file += ".meta";
+    meta_file += metafile_extension;
     return meta_file;
 }
 
 void write_compile_job_to_file(const CompileJob& compile_job)
 {
-    auto meta_file = compile_job.object_file.string() + ".meta";
-
+    const auto meta_file = compile_job.object_file.string() + metafile_extension;
     if (std::ofstream file{meta_file.c_str()}; file) {
         std::println(file, "{}", compile_job.source_file.string());
         std::println(file, "{}", compile_job.object_file.string());
@@ -253,7 +323,7 @@ void prepare_file_compilation(Target& target, const std::string& flags, const bo
     auto object_file = std::filesystem::canonical(build_source_path);
 
     object_file /= source.filename();
-    object_file += ".o";
+    object_file = std::filesystem::path{object_file.string() + object_file_extension};
 
     auto metafile_name = get_file_metafile_name(object_file, build_source_path);
     
@@ -278,7 +348,7 @@ void prepare_file_compilation(Target& target, const std::string& flags, const bo
     target.build_jobs.push_back(Job{new_compile_job});
 }
 
-void prepare_target_compilation(Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
+void prepare_target_compilation(Target& target, const bool use_build_dir = true)
 {
     create_directory_if_missing(build_directory);
     
@@ -294,7 +364,7 @@ void prepare_target_compilation(Target& target, const bool use_build_dir = true,
     }
 }
 
-void prepare_target_linking(Target& target, const bool use_build_dir = true, const std::source_location location = std::source_location::current())
+void prepare_target_linking(Target& target, const bool use_build_dir = true)
 {
     if (not target.needs_linking)
     {
@@ -302,7 +372,7 @@ void prepare_target_linking(Target& target, const bool use_build_dir = true, con
     }
 
     auto canonical_build_dir = std::filesystem::canonical(build_directory);
-    if (not use_build_dir) canonical_build_dir = std::filesystem::canonical(".");
+    if (not use_build_dir) canonical_build_dir = std::filesystem::canonical(current_directory);
 
     auto link_job = LinkJob{};
 
@@ -319,7 +389,7 @@ void prepare_target_linking(Target& target, const bool use_build_dir = true, con
             relative_source_path = source;
         }
 
-        auto build_source_object_file = (canonical_build_dir / relative_source_path) += ".o";
+        auto build_source_object_file = (canonical_build_dir / relative_source_path).string() + object_file_extension;
         link_job.object_files.push_back(build_source_object_file);
     }
 
@@ -330,7 +400,7 @@ void prepare_target_linking(Target& target, const bool use_build_dir = true, con
 
 void run_build(const Target& target)
 {
-    auto jobs_count = target.build_jobs.size();
+    const auto jobs_count = target.build_jobs.size();
     if (jobs_count == 0)
     {
         std::println("{}Nothing to build for target {}{}{}.{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, RESET_FONT);
@@ -344,32 +414,51 @@ void run_build(const Target& target)
         auto percent = static_cast<int>((index + 1) * 100 / jobs_count);
         std::string type{};
         auto color = RED_FONT;
-        std::string command{};
+        std::vector<std::string> command_args{};
 
         if (is_compile_job)
         {
             type = "Compliling";
             color = GREEN_FONT_FAINT;
             auto specific_job = std::get<CompileJob>(job.specific_job);
-            command = std::format("{} {} -c -o {} {}", compiler, specific_job.compile_flags, specific_job.object_file.string(), specific_job.source_file.string());
+            
+            command_args.push_back(compiler);
+            // Split compile_flags by spaces
+            std::istringstream iss(specific_job.compile_flags);
+            std::string flag;
+            while (iss >> flag)
+            {
+                command_args.push_back(flag);
+            }
+            command_args.push_back(compile_flag);
+            command_args.push_back(compile_output_flag);
+            command_args.push_back(specific_job.object_file.string());
+            command_args.push_back(specific_job.source_file.string());
         }
         else
         {
             type = "Linking";
             color = GREEN_FONT;
             auto specific_job = std::get<LinkJob>(job.specific_job);
-            auto link_objects = std::string{};
-
+            
+            command_args.push_back(compiler);
+            command_args.push_back(linker_output_flag);
+            command_args.push_back(specific_job.target_file.string());
             for (const auto& object : specific_job.object_files)
             {
-                link_objects.append(std::string(" ") + object.string());
+                command_args.push_back(object.string());
             }
-
-            command = std::format("{} -o {} {} ", compiler, specific_job.target_file.string(), link_objects);
         }
 
-        std::println("[{:3}%] {}/{} {}{} {}{}", percent, index+1, jobs_count, color, type, command, RESET_FONT);
-        auto result = std::system(command.c_str());  // todo: replace system with something more sophisticated (to let parallel execution)
+        // Display command for user information
+        std::string command_display{};
+        for (const auto& arg : command_args)
+        {
+            command_display += arg + " ";
+        }
+        std::println("[{:3}%] {}/{} {}{} {}{}", percent, index+1, jobs_count, color, type, command_display, RESET_FONT);
+        
+        int result = execute_command(command_args);
         if (result != 0)
         {
             std::println("{}Error: Command failed with code {}. Stopping build.{}", RED_FONT, result, RESET_FONT);
@@ -384,7 +473,7 @@ void run_build(const Target& target)
     }
 }
 
-void build_target(Target& target, const std::source_location location = std::source_location::current())
+void build_target(Target& target)
 {
     if (clean_mode)
     {
@@ -394,8 +483,8 @@ void build_target(Target& target, const std::source_location location = std::sou
     {
         const bool USE_BUILD_DIR {true};
 
-        prepare_target_compilation(target, USE_BUILD_DIR, location);
-        prepare_target_linking(target, USE_BUILD_DIR, location);
+        prepare_target_compilation(target, USE_BUILD_DIR);
+        prepare_target_linking(target, USE_BUILD_DIR);
         run_build(target);
     }
 }
@@ -415,11 +504,11 @@ void clean_target_build_artifacts(const Target& target, const bool use_build_dir
         if (use_build_dir)
         {
             auto canonical_build_dir = std::filesystem::canonical(build_directory);
-            object_file = (canonical_build_dir / source) += ".o";
+            object_file = std::filesystem::path{(canonical_build_dir / source).string() + object_file_extension};
         }
         else
         {
-            (object_file = source) += ".o";
+            object_file = std::filesystem::path{source.string() + object_file_extension};
         }
 
         std::filesystem::remove(object_file);
@@ -436,7 +525,7 @@ void enable_self_rebuild(const std::source_location& location = std::source_loca
     auto& nobs_executable = add_executable(nobs_build_script_source.filename().stem().string());
     
     add_target_source(nobs_executable, nobs_build_script_source.string());
-    add_target_compile_flag(nobs_executable, "--std=c++23");
+    add_target_compile_flag(nobs_executable, default_cpp_standard);
     const bool DONT_USE_BUILD_DIR {false};
     prepare_target_compilation(nobs_executable, DONT_USE_BUILD_DIR);
     prepare_target_linking(nobs_executable, DONT_USE_BUILD_DIR);

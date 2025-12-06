@@ -39,3 +39,46 @@
 
 # debug information files
 *.dwo
+
+# macOS specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.xcodeproj/
+*.playground
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Build artifacts
+build/
+build_dir/
+dist/
+*.dSYM/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Dependencies
+node_modules/
+.bundle/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.log
+
