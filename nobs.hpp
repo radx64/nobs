@@ -20,6 +20,9 @@ namespace nobs
     static std::string compiler = "g++";
     static std::string linker = "g++";
 
+    // TODO: make some parts of code be hidden by some internal namespace
+    // to avoid polluting nobs namespace
+
     constexpr auto RESET_FONT = "\033[0m";
     constexpr auto RED_FONT   = "\033[31;1m";
     constexpr auto GREEN_FONT = "\033[32;1m";
@@ -99,8 +102,6 @@ struct PendingJob {
     bool is_compile_job;
 };
 
-
-
 void set_compiler(const std::string_view& compiler_name)
 {
     compiler = std::string(compiler_name);
@@ -148,13 +149,7 @@ int execute_command(const std::vector<std::string>& args)
     if (pid == 0)
     {
         // Child process
-        std::vector<char*> argv;
-        for (const auto& arg : args)
-        {
-            argv.push_back(const_cast<char*>(arg.c_str()));
-        }
-        argv.push_back(nullptr);
-
+        auto argv = build_argv(args);
         execvp(argv[0], argv.data());
         // If execvp returns, an error occurred
         trace_error("Failed to execute command");
@@ -195,13 +190,22 @@ bool are_dependencies_satisfied(const std::vector<Job>& jobs, size_t job_index)
     return true;
 }
 
-// Print a single job status line. Extracted to improve readability.
+inline std::vector<char*> build_argv(const std::vector<std::string>& args)
+{
+    std::vector<char*> argv;
+    for (const auto& arg : args)
+    {
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+    return argv;
+}
+
 inline void print_job_status(int percent, size_t ordinal, size_t total, std::string_view color, std::string_view type, const std::string& command_display)
 {
     std::println("[{:3}%] {}/{} {}{} {}{}", percent, ordinal, total, color, type, command_display, RESET_FONT);
 }
 
-// Build command arguments for a job. Returns (args, is_compile_job).
 inline std::pair<std::vector<std::string>, bool> build_job_command_args(const Job& job)
 {
     std::vector<std::string> args;
@@ -548,13 +552,11 @@ void run_build(Target& target)
             {
                 auto& job = target.build_jobs[index];
                 
-                // Skip if not pending
                 if (job.status != Job::Status::Pending)
                 {
                     continue;
                 }
                 
-                // Check if dependencies are satisfied
                 if (!are_dependencies_satisfied(target.build_jobs, index))
                 {
                     continue;
@@ -583,13 +585,7 @@ void run_build(Target& target)
                 if (pid == 0)
                 {
                     // Child process
-                    std::vector<char*> argv;
-                    for (const auto& arg : command_args)
-                    {
-                        argv.push_back(const_cast<char*>(arg.c_str()));
-                    }
-                    argv.push_back(nullptr);
-
+                    auto argv = build_argv(command_args);
                     execvp(argv[0], argv.data());
                     // If execvp returns, an error occurred
                     trace_error("Failed to execute command");
