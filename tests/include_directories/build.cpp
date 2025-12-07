@@ -18,7 +18,7 @@ int main(const int argc, const char* argv[])
             "./lib2/includes",
         });
 
-    add_target_compile_flag(demo, "-std=c++23");
+    add_target_compile_flag(demo, "--std=c++23");
     build_target(demo);
 
     return 0;
