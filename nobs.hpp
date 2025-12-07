@@ -17,6 +17,14 @@
 
 namespace nobs {struct Target;}
 
+// TODO: 
+// For implementation of dependencies between libraries
+// 1. Compile commands should be global and target should be able to add other target if needed
+//      like executable need lib so libs should be compiled before
+// Jobs should have a reference to a target and target description should be stateless
+// Target state?
+// 2. Change in linked lib should make target needs relinking
+
 
 namespace nobs::internal
 {
@@ -79,13 +87,15 @@ namespace nobs
 struct Target
 {
     std::string name;
+    enum class Type { Executable, StaticLib} type;
     std::vector<std::filesystem::path> sources;
     std::vector<std::string> compile_flags;
     std::vector<internal::Job> build_jobs{};
     bool needs_linking {false};
 
     Target() = default;
-    Target(const std::string_view& target_name) : name(target_name) {}
+    Target(const std::string_view& target_name, const Target::Type target_type) : name(target_name), type(target_type) 
+    {}
 
     Target(Target&& rhs) = default;
     Target& operator=(Target&& rhs) = default;
@@ -649,7 +659,7 @@ void enable_command_line_params(const int argc, const char* argv[])
 
 Target& add_executable(const std::string_view& name)
 {
-    return internal::targets.emplace_back(name);
+    return internal::targets.emplace_back(name, Target::Type::Executable);
 }
 
 void set_build_directory(const std::string_view& build_dir)
@@ -746,5 +756,14 @@ std::string current_project_directory()
     return internal::project_directory.string();
 }
 
-} // namespace nobs
+Target& add_library(const std::string_view& name)
+{
+    return internal::targets.emplace_back(name, Target::Type::StaticLib);
+}
 
+void target_link_libraries(Target& target, const std::vector<std::reference_wrapper<Target>> libraries)
+{
+
+}
+
+} // namespace nobs
