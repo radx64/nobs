@@ -6,7 +6,7 @@ int main(const int argc, const char* argv[])
     enable_command_line_params(argc, argv);
     enable_self_rebuild();
     set_build_directory("./build_dir");
-    auto& demo = add_executable("demo");
+    auto demo = add_executable("demo");
     add_target_sources(demo, 
         {
             "main.cpp",
@@ -19,7 +19,7 @@ int main(const int argc, const char* argv[])
     build_target(demo);
     
     set_build_directory("./build_dir");
-    auto& demo2 = add_executable("demo2");
+    auto demo2 = add_executable("demo2");
     add_target_sources(demo2, 
         {
             current_project_directory() + "/main.cpp",

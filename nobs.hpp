@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <print>
 #include <ranges>
 #include <source_location>
@@ -17,11 +18,20 @@
 
 namespace nobs {struct Target;}
 
+// TODO: 
+// For implementation of dependencies between libraries
+// 1. Compile commands should be global and target should be able to add other target if needed
+//      like executable need lib so libs should be compiled before
+// Jobs should have a reference to a target and target description should be stateless
+// Target state?
+// 2. Change in linked lib should make target needs relinking
+
 
 namespace nobs::internal
 {
     static std::string compiler = "g++";
     static std::string linker = "g++";
+    static std::string archiver = "ar";
 
     // TODO: make some parts of code be hidden by some internal namespace
     // to avoid polluting nobs namespace
@@ -35,14 +45,24 @@ namespace nobs::internal
 
     constexpr auto metafile_extension = ".meta";
     constexpr auto object_file_extension = ".o";
+    constexpr auto static_lib_extension = ".a";
     constexpr auto default_build_directory = "./build_dir";
     constexpr auto default_cpp_standard = "--std=c++23";
     constexpr auto current_directory = ".";
     constexpr auto compile_flag = "-c";
     constexpr auto compile_output_flag = "-o";
     constexpr auto linker_output_flag = "-o";
+    constexpr auto ar_rcs_flags = "rcs";
 
-struct CompileJob
+class Job
+{
+public:
+    enum class Status { Pending, Running, Completed, Failed };
+    Status status {Status::Pending};
+    std::optional<uint32_t> exit_code { std::nullopt };
+};
+
+struct CompileParameters
 {
     std::filesystem::path source_file;
     std::filesystem::path object_file;
@@ -50,7 +70,7 @@ struct CompileJob
     uint64_t source_timestamp;
 };
 
-bool operator==(const CompileJob& lhs, const CompileJob& rhs)
+bool operator==(const CompileParameters& lhs, const CompileParameters& rhs)
 {
     return lhs.source_file == rhs.source_file and
         lhs.object_file == rhs.object_file and
@@ -58,20 +78,27 @@ bool operator==(const CompileJob& lhs, const CompileJob& rhs)
         lhs.source_timestamp == rhs.source_timestamp;
 }
 
-struct LinkJob
+struct CompileJob : public Job
+{
+    CompileJob(const CompileParameters& compile_params) : params(compile_params) {}
+    
+    CompileParameters params;
+};
+
+struct LinkParameters
 {
     std::vector<std::filesystem::path> object_files;
     std::filesystem::path target_file;
     std::string link_flags;
+    enum class LinkType { Executable, StaticLib } link_type = LinkType::Executable;
 };
 
-struct Job
+struct LinkJob : public Job
 {
-    std::variant<CompileJob, LinkJob> specific_job;
-    std::vector<size_t> depends_on;  // indices of jobs this job depends on
-    enum class Status { Pending, Running, Completed, Failed } status = Status::Pending;
-    int exit_code = 0;
+    LinkJob(const LinkParameters& link_params) : params(link_params) {}
+    LinkParameters params;
 };
+
 } // namespace nobs::internal
 
 namespace nobs
@@ -79,13 +106,13 @@ namespace nobs
 struct Target
 {
     std::string name;
+    enum class Type { Executable, StaticLib} type;
     std::vector<std::filesystem::path> sources;
     std::vector<std::string> compile_flags;
-    std::vector<internal::Job> build_jobs{};
-    bool needs_linking {false};
 
     Target() = default;
-    Target(const std::string_view& target_name) : name(target_name) {}
+    Target(const std::string_view& target_name, const Target::Type target_type) : name(target_name), type(target_type) 
+    {}
 
     Target(Target&& rhs) = default;
     Target& operator=(Target&& rhs) = default;
@@ -94,23 +121,67 @@ protected:
     Target(const Target& rhs) = default;
     Target& operator=(const Target& rhs) = default;
 };
+
+// Wrapper that stores target name and provides reference-like interface
+struct TargetRef
+{
+    std::string target_name;
+
+    TargetRef(const std::string_view& name) : target_name(name) {}
+    TargetRef(const std::string& name) : target_name(name) {}
+    TargetRef(const char* name) : target_name(name) {}
+    TargetRef(const TargetRef&) = default;
+    TargetRef& operator=(const TargetRef&) = default;
+
+    // Allow implicit conversion for convenience
+    operator std::string() const { return target_name; }
+    operator std::string_view() const { return target_name; }
+};
+
+// Helper to make TargetRef work with both const and non-const references
+struct TargetRefOrTarget {
+    TargetRef ref;
+    
+    TargetRefOrTarget(const TargetRef& r) : ref(r) {}
+    TargetRefOrTarget(const std::string& s) : ref(s) {}
+    
+    operator TargetRef() const { return ref; }
+};;
 }  // namespace nobs
 
 namespace nobs::internal
 {
-
 static std::vector<Target> targets {};
+
+struct TargetBuildState
+{
+    const Target& target;
+    std::vector<CompileJob> compile_jobs{};
+    LinkJob link_job{LinkParameters{}};
+
+    bool needs_linking {false};
+
+    bool has_compilation_finished() const
+    {
+        return std::all_of(compile_jobs.begin(), compile_jobs.end(), [](const Job& job) {
+            return job.status == Job::Status::Completed;
+        });
+    }
+
+    bool has_linking_finished() const
+    {
+        return link_job.status == Job::Status::Completed;
+    }
+
+    std::vector<std::reference_wrapper<Target>> depends_on_targets{};
+};
+
+static std::vector<TargetBuildState> target_build_states{};
+
 static std::filesystem::path build_directory {default_build_directory};  // build in "build_dir" by default
 static std::filesystem::path project_directory {std::filesystem::current_path()};
-static bool clean_mode{false};
+static bool clean_mode {false};
 static size_t parallel_jobs = std::thread::hardware_concurrency();
-
-struct PendingJob {
-    size_t job_index;
-    pid_t pid;
-    std::string command_display;
-    bool is_compile_job;
-};
 
 void set_parallel_jobs(size_t num_jobs)
 {
@@ -122,108 +193,28 @@ void trace_error(const std::string_view& error_string, const std::source_locatio
     std::println("{}Error at {}:{}: {}{}", RED_FONT, location.file_name(), location.line(), error_string, RESET_FONT);
 }
 
-inline std::vector<char*> build_argv(const std::vector<std::string>& args)
+inline std::vector<char*> build_argv(const std::vector<std::string>& command)
 {
     std::vector<char*> argv;
-    for (const auto& arg : args)
+
+    for (const auto& arg : command)
     {
         argv.push_back(const_cast<char*>(arg.c_str()));
     }
     argv.push_back(nullptr);
+
     return argv;
 }
 
-int execute_command(const std::vector<std::string>& args)
+inline void print_job_status(int percent, size_t ordinal, size_t total, std::string_view color, std::string_view type, const std::vector<std::string>& command)
 {
-    pid_t pid = fork();
-    if (pid == -1)
-    {
-        trace_error("Failed to fork process");
-        exit(-1);
+    std::string command_str;
+    for (size_t i = 0; i < command.size(); ++i) {
+        command_str += command[i];
+        if (i < command.size() - 1) command_str += " ";
     }
 
-    if (pid == 0)
-    {
-        // Child process
-        auto argv = build_argv(args);
-        execvp(argv[0], argv.data());
-        // If execvp returns, an error occurred
-        trace_error("Failed to execute command");
-        exit(-1);
-    }
-    else
-    {
-        // Parent process
-        int status;
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status))
-        {
-            return WEXITSTATUS(status);
-        }
-        else
-        {
-            trace_error("Child process did not terminate normally");
-            return -1;
-        }
-    }
-}
-
-bool are_dependencies_satisfied(const std::vector<Job>& jobs, size_t job_index)
-{
-    const auto& job = jobs[job_index];
-    for (size_t dep_index : job.depends_on)
-    {
-        if (jobs[dep_index].status != Job::Status::Completed)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-inline void print_job_status(int percent, size_t ordinal, size_t total, std::string_view color, std::string_view type, const std::string& command_display)
-{
-    std::println("[{:3}%] {}/{} {}{} {}{}", percent, ordinal, total, color, type, command_display, RESET_FONT);
-}
-
-inline std::pair<std::vector<std::string>, bool> build_job_command_args(const Job& job)
-{
-    std::vector<std::string> args;
-    if (std::holds_alternative<CompileJob>(job.specific_job))
-    {
-        auto specific_job = std::get<CompileJob>(job.specific_job);
-        args.push_back(compiler);
-        std::istringstream iss(specific_job.compile_flags);
-        std::string flag;
-        while (iss >> flag)
-        {
-            args.push_back(flag);
-        }
-        args.push_back(compile_flag);
-        args.push_back(compile_output_flag);
-        args.push_back(specific_job.object_file.string());
-        args.push_back(specific_job.source_file.string());
-        return {args, true};
-    }
-    else
-    {
-        auto specific_job = std::get<LinkJob>(job.specific_job);
-        args.push_back(compiler);
-        args.push_back(linker_output_flag);
-        args.push_back(specific_job.target_file.string());
-        for (const auto& object : specific_job.object_files)
-        {
-            args.push_back(object.string());
-        }
-        return {args, false};
-    }
-}
-
-inline std::string join_command_display(const std::vector<std::string>& args)
-{
-    std::string out;
-    for (const auto& a : args) { out += a; out += ' '; }
-    return out;
+    std::println("[{:3}%] {}/{} {}{} {}{}", percent, ordinal, total, color, type, command_str, RESET_FONT);
 }
 
 inline int compute_percent(size_t completed, size_t pending, size_t jobs_count)
@@ -244,7 +235,7 @@ void create_directory_if_missing(const std::filesystem::path& directory)
     }
 }
 
-CompileJob read_compile_job_from_file(const std::filesystem::path& job_metafile)
+CompileParameters read_compile_parameters_from_file(const std::filesystem::path& job_metafile)
 {
     std::string job_metafile_name = job_metafile.string();
     std::ifstream file{job_metafile_name};
@@ -255,7 +246,7 @@ CompileJob read_compile_job_from_file(const std::filesystem::path& job_metafile)
         exit(1);
     }
 
-    CompileJob job{};
+    CompileParameters job{};
 
     std::string line{};
 
@@ -293,7 +284,7 @@ auto get_file_metafile_name(const std::filesystem::path& source_file, const std:
     return meta_file;
 }
 
-void write_compile_job_to_file(const CompileJob& compile_job)
+void save_meta_file(const CompileParameters& compile_job)
 {
     const auto meta_file = compile_job.object_file.string() + metafile_extension;
     if (std::ofstream file{meta_file.c_str()}; file) {
@@ -317,6 +308,31 @@ uint64_t get_file_timestamp(const std::filesystem::path& filename)
     {
         return 0;
     }
+}
+
+Target* get_target_by_name(const std::string& target_name)
+{
+    for (auto& target : targets)
+    {
+        if (target.name == target_name)
+        {
+            return &target;
+        }
+    }
+    return nullptr;
+}
+
+TargetBuildState& get_target_build_state(const Target& target)
+{
+    for (auto& tbs : target_build_states)
+    {
+        if (tbs.target.name == target.name)
+        {
+            return tbs;
+        }
+    }
+    target_build_states.push_back(TargetBuildState{target});
+    return target_build_states.back();
 }
 
 void prepare_file_compilation(Target& target, const std::string& flags, const bool use_build_dir, const std::filesystem::path& source)
@@ -354,7 +370,7 @@ void prepare_file_compilation(Target& target, const std::string& flags, const bo
 
     auto metafile_name = get_file_metafile_name(object_file, build_source_path);
     
-    CompileJob new_compile_job{
+    CompileParameters new_compile_parameters{
         .source_file = relative_source_path,
         .object_file = object_file,
         .compile_flags = flags,
@@ -363,16 +379,17 @@ void prepare_file_compilation(Target& target, const std::string& flags, const bo
     
     if (std::filesystem::exists(metafile_name))
     {
-        auto old_compile_job = read_compile_job_from_file(metafile_name);
-        if (old_compile_job == new_compile_job)
+        auto old_compile_parameters = read_compile_parameters_from_file(metafile_name);
+        if (old_compile_parameters == new_compile_parameters)
         {
             // TODO add verbosity level to print that file is up to date
             return;
         }
     }
 
-    target.needs_linking = true;
-    target.build_jobs.push_back(Job{new_compile_job});
+    auto& target_build_state = get_target_build_state(target);
+    target_build_state.compile_jobs.push_back(CompileJob{new_compile_parameters});
+    target_build_state.needs_linking = true; // TODO: when this is set, all targets depending on this one should also be marked for relinking
 }
 
 void prepare_target_compilation(Target& target, const bool use_build_dir = true)
@@ -380,9 +397,13 @@ void prepare_target_compilation(Target& target, const bool use_build_dir = true)
     create_directory_if_missing(build_directory);
     
     std::string flags{};
-    for (const auto & flag : target.compile_flags)
-    {  
-        flags.append(std::format("{} ", flag));
+    for (size_t i = 0; i < target.compile_flags.size(); ++i)
+    {
+        flags.append(target.compile_flags[i]);
+        if (i < target.compile_flags.size() - 1)
+        {
+            flags.append(" ");
+        }
     }
 
     for (const auto& source : target.sources)
@@ -393,7 +414,9 @@ void prepare_target_compilation(Target& target, const bool use_build_dir = true)
 
 void prepare_target_linking(Target& target, const bool use_build_dir = true)
 {
-    if (not target.needs_linking)
+    auto& target_build_state = get_target_build_state(target);
+
+    if (not target_build_state.needs_linking)
     {
         return;
     }
@@ -401,7 +424,7 @@ void prepare_target_linking(Target& target, const bool use_build_dir = true)
     auto canonical_build_dir = std::filesystem::canonical(build_directory);
     if (not use_build_dir) canonical_build_dir = std::filesystem::canonical(current_directory);
 
-    auto link_job = LinkJob{};
+    auto link_params = LinkParameters{};
 
     for (const auto& source : target.sources)
     {
@@ -417,64 +440,129 @@ void prepare_target_linking(Target& target, const bool use_build_dir = true)
         }
 
         auto build_source_object_file = (canonical_build_dir / relative_source_path).string() + object_file_extension;
-        link_job.object_files.push_back(build_source_object_file);
+        link_params.object_files.push_back(build_source_object_file);
     }
 
-    link_job.target_file = (canonical_build_dir / target.name);
-    link_job.link_flags = ""; // TODO add link flags support to Target
-    
-    // Link job depends on all compile jobs
-    Job link_job_with_deps{.specific_job = link_job};
-    for (size_t i = 0; i < target.build_jobs.size(); ++i)
+    // Add dependencies (static libraries) to the object files
+    for (const auto& dep_target : target_build_state.depends_on_targets)
     {
-        link_job_with_deps.depends_on.push_back(i);
+        auto lib_name = std::string("lib") + dep_target.get().name + static_lib_extension;
+        auto lib_file = canonical_build_dir / lib_name;
+        link_params.object_files.push_back(lib_file.string());
     }
-    target.build_jobs.push_back(link_job_with_deps);
+
+    // Determine target file name and link type
+    if (target.type == Target::Type::Executable)
+    {
+        link_params.target_file = (canonical_build_dir / target.name);
+        link_params.link_type = LinkParameters::LinkType::Executable;
+    }
+    else if (target.type == Target::Type::StaticLib)
+    {
+        auto lib_name = std::string("lib") + target.name + static_lib_extension;
+        link_params.target_file = (canonical_build_dir / lib_name);
+        link_params.link_type = LinkParameters::LinkType::StaticLib;
+    }
+    
+    link_params.link_flags = ""; // TODO add link flags support to Target
+    target_build_state.link_job = LinkJob{link_params};
 }
 
-void run_build(Target& target)
+struct PendingCompileProcess {
+    size_t job_index;
+    pid_t pid;
+};
+
+std::vector<std::string> build_command_for_compile_job(const CompileJob& compile_job)
 {
-    const auto jobs_count = target.build_jobs.size();
+    std::vector<std::string> command_args{};
+    command_args.push_back(compiler);
+
+    std::istringstream iss(compile_job.params.compile_flags);
+    std::string flag;
+    while (iss >> flag)
+    {
+        command_args.push_back(flag);
+    }
+
+    command_args.push_back(compile_flag);
+    command_args.push_back(compile_output_flag);
+    command_args.push_back(compile_job.params.object_file.string());
+    command_args.push_back(compile_job.params.source_file.string());
+
+    return command_args;
+}
+
+std::vector<std::string> build_command_for_link_job(const LinkJob& link_job)
+{
+    std::vector<std::string> command_args{};
+    
+    if (link_job.params.link_type == LinkParameters::LinkType::StaticLib)
+    {
+        // Use ar for static libraries
+        command_args.push_back(archiver);
+        command_args.push_back(ar_rcs_flags);
+        command_args.push_back(link_job.params.target_file.string());
+        
+        for (const auto& obj : link_job.params.object_files)
+        {
+            command_args.push_back(obj.string());
+        }
+    }
+    else
+    {
+        // Use linker for executables
+        command_args.push_back(linker);
+        command_args.push_back(linker_output_flag);
+        command_args.push_back(link_job.params.target_file.string());
+
+        for (const auto& obj : link_job.params.object_files)
+        {
+            command_args.push_back(obj.string());
+        }
+    }
+
+    return command_args;
+}
+
+void run_compile_stage(const Target& target)
+{
+    auto& target_build_state = get_target_build_state(target);
+
+    const auto jobs_count = target_build_state.compile_jobs.size();
     if (jobs_count == 0)
     {
-        std::println("{}Nothing to build for target {}{}{}.{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, RESET_FONT);
+        std::println("{}Nothing to compile for target {}{}{}.{}", internal::GREEN_FONT, internal::RED_FONT, target.name, internal::GREEN_FONT, internal::RESET_FONT);
         return;
     }
-    std::println("{}Running build of {}{}{} with {} jobs (max {} parallel)...{}", GREEN_FONT, RED_FONT, target.name, GREEN_FONT, jobs_count, parallel_jobs, RESET_FONT);
-    
-    std::vector<PendingJob> pending_jobs;
+
+    std::println("{}Running compile stage of {}{}{} with {} jobs (max {} parallel)...{}", internal::GREEN_FONT, internal::RED_FONT, target.name, internal::GREEN_FONT, jobs_count, internal::parallel_jobs, internal::RESET_FONT);
+
+    std::vector<PendingCompileProcess> pending_processes;
     size_t completed_jobs = 0;
-    
+
     while (completed_jobs < jobs_count)
     {
-        for (auto it = pending_jobs.begin(); it != pending_jobs.end(); )
+        for (auto it = pending_processes.begin(); it != pending_processes.end(); )
         {
             int status;
             pid_t result = waitpid(it->pid, &status, WNOHANG);
             
-            if (result == it->pid)  // Child process completed
+            if (result == it->pid)
             {
-                auto& job = target.build_jobs[it->job_index];
                 int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-                job.exit_code = exit_code;
                 
                 if (exit_code != 0)
                 {
-                    job.status = Job::Status::Failed;
-                    std::println("{}Error: Command failed with code {}. Stopping build.{}", RED_FONT, exit_code, RESET_FONT);
+                    std::println("{}Error: Command failed with code {}. Stopping build.{}", internal::RED_FONT, exit_code, internal::RESET_FONT);
                     exit(exit_code);
                 }
                 
-                job.status = Job::Status::Completed;
                 completed_jobs++;
+                target_build_state.compile_jobs[it->job_index].status = Job::Status::Completed;
+                save_meta_file(target_build_state.compile_jobs[it->job_index].params);
                 
-                if (it->is_compile_job)
-                {
-                    auto specific_job = std::get<CompileJob>(job.specific_job);
-                    write_compile_job_to_file(specific_job);
-                }
-                
-                it = pending_jobs.erase(it);
+                it = pending_processes.erase(it);
             }
             else
             {
@@ -482,74 +570,96 @@ void run_build(Target& target)
             }
         }
         
-        // Spawn new jobs if we have capacity and dependencies are satisfied
-        while (pending_jobs.size() < parallel_jobs && completed_jobs + pending_jobs.size() < jobs_count)
+        while (pending_processes.size() < internal::parallel_jobs && completed_jobs + pending_processes.size() < target_build_state.compile_jobs.size())
         {
-            bool found_ready_job = false;
+            size_t index = completed_jobs + pending_processes.size();
+            auto& compile_job = target_build_state.compile_jobs[index];
             
-            for (size_t index = 0; index < jobs_count; ++index)
+            if (compile_job.status == Job::Status::Pending)
             {
-                auto& job = target.build_jobs[index];
+                compile_job.status = Job::Status::Running;
                 
-                if (job.status != Job::Status::Pending)
-                {
-                    continue;
-                }
+                auto percent = compute_percent(completed_jobs, pending_processes.size(), jobs_count);
+                auto command_args = build_command_for_compile_job(compile_job);
+                print_job_status(percent, completed_jobs + pending_processes.size(), jobs_count, internal::GREEN_FONT_FAINT, "Compiling", command_args);
                 
-                if (!are_dependencies_satisfied(target.build_jobs, index))
-                {
-                    continue;
-                }
-
-                found_ready_job = true;
-
-                auto [command_args, is_compile_job] = build_job_command_args(job);
-                auto percent = compute_percent(completed_jobs, pending_jobs.size(), jobs_count);
-                auto color = is_compile_job ? GREEN_FONT_FAINT : GREEN_FONT;
-                auto type = is_compile_job ? "Compiling" : "Linking";
-
-                std::string command_display = join_command_display(command_args);
-                print_job_status(percent, completed_jobs + pending_jobs.size() + 1, jobs_count, color, type, command_display);
-
-                job.status = Job::Status::Running;
-
-                // Fork and execute the command
                 pid_t pid = fork();
-                if (pid == -1)
-                {
-                    trace_error("Failed to fork process");
-                    exit(-1);
-                }
-
                 if (pid == 0)
                 {
-                    // Child process
                     auto argv = build_argv(command_args);
                     execvp(argv[0], argv.data());
-                    // If execvp returns, an error occurred
-                    trace_error("Failed to execute command");
                     exit(-1);
                 }
-                else
-                {
-                    // Parent process - track the job
-                    pending_jobs.push_back({index, pid, command_display, is_compile_job});
-                    break;  // Go back to check for completions
-                }
-            }
-            
-            if (!found_ready_job)
-            {
-                break;  // No more ready jobs, wait for some to complete
+                
+                pending_processes.push_back({index, pid});
             }
         }
         
-        // If we have pending jobs, wait a bit before checking again
-        if (!pending_jobs.empty())
+        if (!pending_processes.empty())
         {
-            usleep(10000);  // 10ms sleep to avoid busy-waiting
+            usleep(10000);
         }
     }
+}
+
+void run_link_stage(const Target& target)
+{
+    auto& target_build_state = get_target_build_state(target);
+
+    if (!target_build_state.needs_linking)
+    {
+        std::println("{}Nothing to link for target {}{}{}.{}", internal::GREEN_FONT, internal::RED_FONT, target.name, internal::GREEN_FONT, internal::RESET_FONT);
+        return;
+    }
+
+    std::println("{}Running link stage of {}{}{}.{}", internal::GREEN_FONT, internal::RED_FONT, target.name, internal::GREEN_FONT, internal::RESET_FONT);
+
+    target_build_state.link_job.status = Job::Status::Running;
+    auto command_args = build_command_for_link_job(target_build_state.link_job);
+    print_job_status(100, 1, 1, internal::GREEN_FONT, "Linking", command_args);
+    
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        auto argv = build_argv(command_args);
+        execvp(argv[0], argv.data());
+        exit(-1);
+    }
+    else
+    {
+        int status;
+        pid_t result = waitpid(pid, &status, 0);
+        
+        if (result == pid)
+        {
+            int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            
+            if (exit_code != 0)
+            {
+                std::println("{}Error: Linking failed with code {}. Stopping build.{}", internal::RED_FONT, exit_code, internal::RESET_FONT);
+                exit(exit_code);
+            }
+            
+            target_build_state.link_job.status = Job::Status::Completed;
+            std::println("{}Linking completed successfully.{}", internal::GREEN_FONT, internal::RESET_FONT);
+        }
+    }
+}
+
+void run_build(const Target& target)
+{
+    auto& target_build_state = get_target_build_state(target);
+
+    const auto jobs_count = target_build_state.compile_jobs.size();
+    if (jobs_count == 0)
+    {
+        std::println("{}Nothing to build for target {}{}{}.{}", internal::GREEN_FONT, internal::RED_FONT, target.name, internal::GREEN_FONT, internal::RESET_FONT);
+        return;
+    }
+
+    std::println("{}Running build of {}{}{} with {} jobs (max {} parallel)...{}", internal::GREEN_FONT, internal::RED_FONT, target.name, internal::GREEN_FONT, jobs_count, internal::parallel_jobs, internal::RESET_FONT);
+    run_compile_stage(target);
+    run_link_stage(target);
 }
 
 void restart_itself(const std::string& binary_name)
@@ -580,15 +690,19 @@ void clean_target_build_artifacts(const Target& target, const bool use_build_dir
 
 }  // namespace nobs::internal
 
-
 namespace nobs
 {
 
-void add_target_include_directories(Target& target, const std::vector<std::string_view>& include_dirs)
+void add_target_include_directories(TargetRef target_ref, const std::vector<std::string_view>& include_dirs)
 {
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name));
+        exit(1);
+    }
     for (const auto& dir : include_dirs)
     {
-        target.compile_flags.push_back(std::format("-I{}", dir));
+        target->compile_flags.push_back(std::format("-I{}", dir));
     }    
 }
 
@@ -647,9 +761,9 @@ void enable_command_line_params(const int argc, const char* argv[])
     }
 }
 
-Target& add_executable(const std::string_view& name)
+TargetRef add_executable(const std::string_view& name)
 {
-    return internal::targets.emplace_back(name);
+    return internal::targets.emplace_back(name, Target::Type::Executable).name;
 }
 
 void set_build_directory(const std::string_view& build_dir)
@@ -657,15 +771,20 @@ void set_build_directory(const std::string_view& build_dir)
     internal::build_directory = std::string(build_dir);
 }
 
-void add_target_sources(Target& target, 
+void add_target_sources(TargetRef target_ref, 
     const std::vector<std::string_view>& sources, 
     const std::source_location location = std::source_location::current())
 {
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name), location);
+        exit(1);
+    }
     for (const auto& source : sources)
     {
         if (std::filesystem::exists(source))
         {
-            target.sources.push_back(std::filesystem::path(source));
+            target->sources.push_back(std::filesystem::path(source));
         }
         else
         {
@@ -675,30 +794,41 @@ void add_target_sources(Target& target,
     }
 }
 
-void add_target_source(Target& target,
+void add_target_source(TargetRef target_ref,
     const std::string_view& source, 
     const std::source_location location = std::source_location::current())
 {
-    add_target_sources(target, {source}, location);
+    add_target_sources(target_ref, {source}, location);
 }
 
-void add_target_compile_flags(Target& target,
+void add_target_compile_flags(TargetRef target_ref,
     const std::vector<std::string_view>& flags)
 {
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name));
+        exit(1);
+    }
     for (const auto& flag : flags)
     {
-        target.compile_flags.push_back(std::string(flag));
+        target->compile_flags.push_back(std::string(flag));
     }    
 }
 
-void add_target_compile_flag(Target& target,
+void add_target_compile_flag(TargetRef target_ref,
     const std::string_view& flag)
 {
-    add_target_compile_flags(target, {flag});
+    add_target_compile_flags(target_ref, {flag});
 }
 
-void build_target(Target& target)
+void build_target(TargetRef target_ref)
 {
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name));
+        exit(1);
+    }
+    
     if (internal::clean_mode)
     {
         std::filesystem::remove_all(internal::build_directory);
@@ -707,9 +837,19 @@ void build_target(Target& target)
     {
         const bool USE_BUILD_DIR {true};
 
-        internal::prepare_target_compilation(target, USE_BUILD_DIR);
-        internal::prepare_target_linking(target, USE_BUILD_DIR);
-        internal::run_build(target);
+        // First, build all dependencies
+        auto& target_build_state = internal::get_target_build_state(*target);
+        for (auto& dependency_target : target_build_state.depends_on_targets)
+        {
+            internal::prepare_target_compilation(dependency_target.get(), USE_BUILD_DIR);
+            internal::prepare_target_linking(dependency_target.get(), USE_BUILD_DIR);
+            internal::run_build(dependency_target.get());
+        }
+
+        // Then build the target itself
+        internal::prepare_target_compilation(*target, USE_BUILD_DIR);
+        internal::prepare_target_linking(*target, USE_BUILD_DIR);
+        internal::run_build(*target);
     }
 }
 
@@ -719,21 +859,26 @@ void enable_self_rebuild(const std::source_location& location = std::source_loca
     std::println("{}Nobs self rebuild active. File {} will be checked for changes every time build process is run {}", 
         internal::YELLOW_FONT, std::filesystem::canonical(nobs_build_script_source).string(), internal::RESET_FONT);
 
-    auto& nobs_executable = add_executable(nobs_build_script_source.filename().stem().string());
+    auto nobs_executable_ref = add_executable(nobs_build_script_source.filename().stem().string());
     
-    add_target_source(nobs_executable, nobs_build_script_source.string());
-    add_target_compile_flag(nobs_executable, internal::default_cpp_standard);
+    add_target_source(nobs_executable_ref, nobs_build_script_source.string());
+    add_target_compile_flag(nobs_executable_ref, internal::default_cpp_standard);
     const bool DONT_USE_BUILD_DIR {false};
-    internal::prepare_target_compilation(nobs_executable, DONT_USE_BUILD_DIR);
-    internal::prepare_target_linking(nobs_executable, DONT_USE_BUILD_DIR);
-    if (nobs_executable.needs_linking == false)
+    
+    auto nobs_executable = internal::get_target_by_name(nobs_executable_ref.target_name);
+    internal::prepare_target_compilation(*nobs_executable, DONT_USE_BUILD_DIR);
+    internal::prepare_target_linking(*nobs_executable, DONT_USE_BUILD_DIR);
+
+    auto& nobs_executable_build_state = internal::get_target_build_state(*nobs_executable);
+
+    if (nobs_executable_build_state.needs_linking == false)
     {
         std::println("{}Nobs build script has not changed. No need to rebuild.{}", internal::GREEN_FONT, internal::RESET_FONT);
         return;
     }
-    internal::run_build(nobs_executable);
-    internal::clean_target_build_artifacts(nobs_executable, DONT_USE_BUILD_DIR);
-    internal::restart_itself(nobs_executable.name);
+    internal::run_build(*nobs_executable);
+    internal::clean_target_build_artifacts(*nobs_executable, DONT_USE_BUILD_DIR);
+    internal::restart_itself(nobs_executable->name);
 }
 
 void set_project_directory(const std::string_view& project_dir)
@@ -746,5 +891,30 @@ std::string current_project_directory()
     return internal::project_directory.string();
 }
 
-} // namespace nobs
+TargetRef add_library(const std::string_view& name)
+{
+    return TargetRef(internal::targets.emplace_back(name, Target::Type::StaticLib).name);
+}
 
+void target_link_libraries(TargetRef target_ref, const std::vector<TargetRef> libraries)
+{
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name));
+        exit(1);
+    }
+    auto& target_build_state = internal::get_target_build_state(*target);
+    
+    // Convert TargetRef names to Target references
+    for (const auto& lib_ref : libraries)
+    {
+        auto lib_target = internal::get_target_by_name(lib_ref.target_name);
+        if (!lib_target) {
+            internal::trace_error(std::format("Library target {} not found", lib_ref.target_name));
+            exit(1);
+        }
+        target_build_state.depends_on_targets.push_back(std::ref(*lib_target));
+    }
+}
+
+} // namespace nobs

@@ -43,7 +43,8 @@ Check out the `tests/simple_demo` directory for example usage and project config
 - [ ] Linking parameters support
 - [x] Dependency graph support (build ordering of files)
 - [x] Parallel translation units compilation support
-- [ ] Static and shared libraries support
+- [x] Static libraries support
+- [ ] Shared libraries support
 - [ ] Windows support
 
 ## License

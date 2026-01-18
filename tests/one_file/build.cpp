@@ -7,7 +7,7 @@ int main(int argc, const char* argv[])
     enable_command_line_params(argc, argv);
     set_build_directory("./build_dir");
 
-    auto& target = add_executable("one_file_app");
+    auto target = add_executable("one_file_app");
     add_target_source(target, "main.cpp");
     add_target_compile_flag(target, "--std=c++26");
 
@@ -15,4 +15,3 @@ int main(int argc, const char* argv[])
 
     return 0;
 }
-
