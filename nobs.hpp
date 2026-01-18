@@ -121,23 +121,37 @@ protected:
     Target(const Target& rhs) = default;
     Target& operator=(const Target& rhs) = default;
 };
+
+// Wrapper that stores target name and provides reference-like interface
+struct TargetRef
+{
+    std::string target_name;
+
+    TargetRef(const std::string_view& name) : target_name(name) {}
+    TargetRef(const std::string& name) : target_name(name) {}
+    TargetRef(const char* name) : target_name(name) {}
+    TargetRef(const TargetRef&) = default;
+    TargetRef& operator=(const TargetRef&) = default;
+
+    // Allow implicit conversion for convenience
+    operator std::string() const { return target_name; }
+    operator std::string_view() const { return target_name; }
+};
+
+// Helper to make TargetRef work with both const and non-const references
+struct TargetRefOrTarget {
+    TargetRef ref;
+    
+    TargetRefOrTarget(const TargetRef& r) : ref(r) {}
+    TargetRefOrTarget(const std::string& s) : ref(s) {}
+    
+    operator TargetRef() const { return ref; }
+};;
 }  // namespace nobs
 
 namespace nobs::internal
 {
 static std::vector<Target> targets {};
-
-// Reserve capacity to avoid reallocation which would invalidate references
-// This should be enough for most builds
-static constexpr size_t INITIAL_TARGETS_CAPACITY = 128;
-
-void ensure_targets_capacity()
-{
-    if (targets.capacity() < INITIAL_TARGETS_CAPACITY)
-    {
-        targets.reserve(INITIAL_TARGETS_CAPACITY);
-    }
-}
 
 struct TargetBuildState
 {
@@ -294,6 +308,18 @@ uint64_t get_file_timestamp(const std::filesystem::path& filename)
     {
         return 0;
     }
+}
+
+Target* get_target_by_name(const std::string& target_name)
+{
+    for (auto& target : targets)
+    {
+        if (target.name == target_name)
+        {
+            return &target;
+        }
+    }
+    return nullptr;
 }
 
 TargetBuildState& get_target_build_state(const Target& target)
@@ -664,15 +690,19 @@ void clean_target_build_artifacts(const Target& target, const bool use_build_dir
 
 }  // namespace nobs::internal
 
-
 namespace nobs
 {
 
-void add_target_include_directories(Target& target, const std::vector<std::string_view>& include_dirs)
+void add_target_include_directories(TargetRef target_ref, const std::vector<std::string_view>& include_dirs)
 {
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name));
+        exit(1);
+    }
     for (const auto& dir : include_dirs)
     {
-        target.compile_flags.push_back(std::format("-I{}", dir));
+        target->compile_flags.push_back(std::format("-I{}", dir));
     }    
 }
 
@@ -731,10 +761,9 @@ void enable_command_line_params(const int argc, const char* argv[])
     }
 }
 
-Target& add_executable(const std::string_view& name)
+TargetRef add_executable(const std::string_view& name)
 {
-    internal::ensure_targets_capacity();
-    return internal::targets.emplace_back(name, Target::Type::Executable);
+    return internal::targets.emplace_back(name, Target::Type::Executable).name;
 }
 
 void set_build_directory(const std::string_view& build_dir)
@@ -742,15 +771,20 @@ void set_build_directory(const std::string_view& build_dir)
     internal::build_directory = std::string(build_dir);
 }
 
-void add_target_sources(Target& target, 
+void add_target_sources(TargetRef target_ref, 
     const std::vector<std::string_view>& sources, 
     const std::source_location location = std::source_location::current())
 {
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name), location);
+        exit(1);
+    }
     for (const auto& source : sources)
     {
         if (std::filesystem::exists(source))
         {
-            target.sources.push_back(std::filesystem::path(source));
+            target->sources.push_back(std::filesystem::path(source));
         }
         else
         {
@@ -760,30 +794,41 @@ void add_target_sources(Target& target,
     }
 }
 
-void add_target_source(Target& target,
+void add_target_source(TargetRef target_ref,
     const std::string_view& source, 
     const std::source_location location = std::source_location::current())
 {
-    add_target_sources(target, {source}, location);
+    add_target_sources(target_ref, {source}, location);
 }
 
-void add_target_compile_flags(Target& target,
+void add_target_compile_flags(TargetRef target_ref,
     const std::vector<std::string_view>& flags)
 {
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name));
+        exit(1);
+    }
     for (const auto& flag : flags)
     {
-        target.compile_flags.push_back(std::string(flag));
+        target->compile_flags.push_back(std::string(flag));
     }    
 }
 
-void add_target_compile_flag(Target& target,
+void add_target_compile_flag(TargetRef target_ref,
     const std::string_view& flag)
 {
-    add_target_compile_flags(target, {flag});
+    add_target_compile_flags(target_ref, {flag});
 }
 
-void build_target(Target& target)
+void build_target(TargetRef target_ref)
 {
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name));
+        exit(1);
+    }
+    
     if (internal::clean_mode)
     {
         std::filesystem::remove_all(internal::build_directory);
@@ -793,7 +838,7 @@ void build_target(Target& target)
         const bool USE_BUILD_DIR {true};
 
         // First, build all dependencies
-        auto& target_build_state = internal::get_target_build_state(target);
+        auto& target_build_state = internal::get_target_build_state(*target);
         for (auto& dependency_target : target_build_state.depends_on_targets)
         {
             internal::prepare_target_compilation(dependency_target.get(), USE_BUILD_DIR);
@@ -802,9 +847,9 @@ void build_target(Target& target)
         }
 
         // Then build the target itself
-        internal::prepare_target_compilation(target, USE_BUILD_DIR);
-        internal::prepare_target_linking(target, USE_BUILD_DIR);
-        internal::run_build(target);
+        internal::prepare_target_compilation(*target, USE_BUILD_DIR);
+        internal::prepare_target_linking(*target, USE_BUILD_DIR);
+        internal::run_build(*target);
     }
 }
 
@@ -814,24 +859,26 @@ void enable_self_rebuild(const std::source_location& location = std::source_loca
     std::println("{}Nobs self rebuild active. File {} will be checked for changes every time build process is run {}", 
         internal::YELLOW_FONT, std::filesystem::canonical(nobs_build_script_source).string(), internal::RESET_FONT);
 
-    auto& nobs_executable = add_executable(nobs_build_script_source.filename().stem().string());
+    auto nobs_executable_ref = add_executable(nobs_build_script_source.filename().stem().string());
     
-    add_target_source(nobs_executable, nobs_build_script_source.string());
-    add_target_compile_flag(nobs_executable, internal::default_cpp_standard);
+    add_target_source(nobs_executable_ref, nobs_build_script_source.string());
+    add_target_compile_flag(nobs_executable_ref, internal::default_cpp_standard);
     const bool DONT_USE_BUILD_DIR {false};
-    internal::prepare_target_compilation(nobs_executable, DONT_USE_BUILD_DIR);
-    internal::prepare_target_linking(nobs_executable, DONT_USE_BUILD_DIR);
+    
+    auto nobs_executable = internal::get_target_by_name(nobs_executable_ref.target_name);
+    internal::prepare_target_compilation(*nobs_executable, DONT_USE_BUILD_DIR);
+    internal::prepare_target_linking(*nobs_executable, DONT_USE_BUILD_DIR);
 
-    auto& nobs_executable_build_state = internal::get_target_build_state(nobs_executable);
+    auto& nobs_executable_build_state = internal::get_target_build_state(*nobs_executable);
 
     if (nobs_executable_build_state.needs_linking == false)
     {
         std::println("{}Nobs build script has not changed. No need to rebuild.{}", internal::GREEN_FONT, internal::RESET_FONT);
         return;
     }
-    internal::run_build(nobs_executable);
-    internal::clean_target_build_artifacts(nobs_executable, DONT_USE_BUILD_DIR);
-    internal::restart_itself(nobs_executable.name);
+    internal::run_build(*nobs_executable);
+    internal::clean_target_build_artifacts(*nobs_executable, DONT_USE_BUILD_DIR);
+    internal::restart_itself(nobs_executable->name);
 }
 
 void set_project_directory(const std::string_view& project_dir)
@@ -844,16 +891,30 @@ std::string current_project_directory()
     return internal::project_directory.string();
 }
 
-Target& add_library(const std::string_view& name)
+TargetRef add_library(const std::string_view& name)
 {
-    internal::ensure_targets_capacity();
-    return internal::targets.emplace_back(name, Target::Type::StaticLib);
+    return TargetRef(internal::targets.emplace_back(name, Target::Type::StaticLib).name);
 }
 
-void target_link_libraries(Target& target, const std::vector<std::reference_wrapper<Target>> libraries)
+void target_link_libraries(TargetRef target_ref, const std::vector<TargetRef> libraries)
 {
-    auto& target_build_state = internal::get_target_build_state(target);
-    target_build_state.depends_on_targets = libraries;
+    auto target = internal::get_target_by_name(target_ref.target_name);
+    if (!target) {
+        internal::trace_error(std::format("Target {} not found", target_ref.target_name));
+        exit(1);
+    }
+    auto& target_build_state = internal::get_target_build_state(*target);
+    
+    // Convert TargetRef names to Target references
+    for (const auto& lib_ref : libraries)
+    {
+        auto lib_target = internal::get_target_by_name(lib_ref.target_name);
+        if (!lib_target) {
+            internal::trace_error(std::format("Library target {} not found", lib_ref.target_name));
+            exit(1);
+        }
+        target_build_state.depends_on_targets.push_back(std::ref(*lib_target));
+    }
 }
 
 } // namespace nobs
